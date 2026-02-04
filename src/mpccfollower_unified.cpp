@@ -36,7 +36,7 @@ double vxMax = 1.0;
 double vyMax = 1.0;
 double wMax = 0.5;
 double vsMax = 1.0;
-double vsMin = 0.0;
+double vsMin = -1.0;  // Allow negative for reverse
 double sTrust = 1.0;
 
 double qC = 20.0;
@@ -51,6 +51,11 @@ double rW = 1.0;
 double rVs = 0.5;
 double qVs = 0.2; // progress reward (linear term)
 
+// **NEW: Direction guidance parameters**
+double qVsDir = 5.0;      // Weight for direction guidance (encourage vs to match path direction)
+double qGearSwitch = 10.0; // Penalty for gear switching (discourage frequent direction changes)
+double rInPlaceRot = 0.1;  // Reduced control penalty for in-place rotation segments
+
 double stopDisThre = 0.2;
 double maxSpeed = 1.0;
 bool autonomyMode = false;
@@ -63,12 +68,10 @@ double alignYawThreDeg = 10.0;
 double alignYawSpeed = 0.3;
 double alignTimeoutS = 8.0;
 
-bool gearAutoEnable = true;
-double rotatePathLenThre = 0.05;
-double rotateDsThre = 0.02;
+// **MODIFIED: Simplified gear control - let optimizer decide**
+bool usePathDirectionHint = true;  // Use path direction as soft guidance
+double inPlaceRotThreshold = 0.05; // Threshold to detect in-place rotation segments [m]
 double rotateYawThreDeg = 20.0;
-double rotateYawKp = 2.0;
-double rotateWMax = 1.0;
 
 // cmd smoothing
 bool enableCmdSmoothing = false;
@@ -109,10 +112,12 @@ std::vector<double> pathX;
 std::vector<double> pathY;
 std::vector<double> pathYaw;
 std::vector<double> pathS;
+std::vector<int> pathDir;     // **NEW: Path direction indicator (+1=forward, -1=reverse, 0=in-place)
 
 static geometry_msgs::Twist targetCmd;
 static geometry_msgs::Twist lastCmd;
 static double lastCmdTime = 0.0;
+static double lastVsSign = 1.0;  // **NEW: Track previous direction for gear switch penalty
 
 static ros::Publisher pubGoalReached;
 static double align_start_time = 0.0;
@@ -194,21 +199,71 @@ void goalHandler(const geometry_msgs::PoseStamped::ConstPtr &goal)
   align_mode_active = false;
 }
 
-static void computePathYawAndS()
+// **NEW: Compute path direction indicators**
+static void computePathYawAndDirection()
 {
   const int n = static_cast<int>(pathX.size());
   pathYaw.assign(n, 0.0);
   pathS.assign(n, 0.0);
+  pathDir.assign(n, 1);  // Default forward
   if (n <= 1) return;
 
+  // Compute yaw and s from path geometry
   for (int i = 0; i < n - 1; i++)
   {
     double dx = pathX[i + 1] - pathX[i];
     double dy = pathY[i + 1] - pathY[i];
+    double ds = hypot(dx, dy);
     pathYaw[i] = atan2(dy, dx);
-    pathS[i + 1] = pathS[i] + hypot(dx, dy);
+    pathS[i + 1] = pathS[i] + ds;
   }
   pathYaw[n - 1] = pathYaw[n - 2];
+
+  // **IMPROVED: Direction detection with look-ahead**
+  for (int i = 0; i < n; i++)
+  {
+    // Look ahead to accumulate sufficient distance
+    double accumDist = 0.0;
+    double totalDx = 0.0;
+    double totalDy = 0.0;
+    int lookAheadIdx = i;
+
+    while (lookAheadIdx + 1 < n && accumDist < inPlaceRotThreshold)
+    {
+      double dx = pathX[lookAheadIdx + 1] - pathX[lookAheadIdx];
+      double dy = pathY[lookAheadIdx + 1] - pathY[lookAheadIdx];
+      totalDx += dx;
+      totalDy += dy;
+      accumDist += hypot(dx, dy);
+      lookAheadIdx++;
+    }
+
+    // Check if this is truly in-place rotation
+    bool isInPlaceRotation = false;
+    if (accumDist < inPlaceRotThreshold * 0.5)
+    {
+      double yawChange = (lookAheadIdx > i) ? fabs(wrapAngle(pathYaw[lookAheadIdx] - pathYaw[i])) : 0.0;
+      if (yawChange > rotateYawThreDeg * PI / 180.0)
+      {
+        isInPlaceRotation = true;
+      }
+    }
+
+    if (isInPlaceRotation)
+    {
+      pathDir[i] = 0;  // In-place rotation
+    }
+    else if (accumDist > 1e-4)
+    {
+      // Sufficient displacement - use motion direction as reference
+      double motionYaw = atan2(totalDy, totalDx);
+      pathDir[i] = 1;  // Default forward (no orientation info in this mode)
+    }
+    else
+    {
+      pathDir[i] = (i > 0) ? pathDir[i - 1] : 1;
+    }
+  }
 
   // unwrap yaw for smooth interpolation
   for (int i = 1; i < n; i++)
@@ -227,6 +282,7 @@ void pathHandler(const nav_msgs::Path::ConstPtr &pathIn)
   pathY.resize(pathSize);
   pathYaw.resize(pathSize);
   pathS.resize(pathSize);
+  pathDir.resize(pathSize);
 
   bool anyYaw = false;
   for (int i = 0; i < pathSize; i++)
@@ -250,6 +306,7 @@ void pathHandler(const nav_msgs::Path::ConstPtr &pathIn)
   const bool usePathOrientation = (chassisType == "omni" || chassisType == "holonomic");
   if (usePathOrientation && anyYaw)
   {
+    // Use path-provided orientations
     pathS[0] = 0.0;
     for (int i = 1; i < pathSize; i++)
     {
@@ -258,6 +315,68 @@ void pathHandler(const nav_msgs::Path::ConstPtr &pathIn)
       double ds = hypot(dx, dy);
       pathS[i] = pathS[i - 1] + ds;
     }
+
+    // **IMPROVED: Infer direction with look-ahead strategy**
+    // For dense paths, accumulate distance until threshold is reached
+    for (int i = 0; i < pathSize; i++)
+    {
+      // Look ahead to accumulate sufficient distance
+      double accumDist = 0.0;
+      double totalDx = 0.0;
+      double totalDy = 0.0;
+      int lookAheadIdx = i;
+
+      // Accumulate distance by looking ahead
+      while (lookAheadIdx + 1 < pathSize && accumDist < inPlaceRotThreshold)
+      {
+        double dx = pathX[lookAheadIdx + 1] - pathX[lookAheadIdx];
+        double dy = pathY[lookAheadIdx + 1] - pathY[lookAheadIdx];
+        totalDx += dx;
+        totalDy += dy;
+        accumDist += hypot(dx, dy);
+        lookAheadIdx++;
+      }
+
+      // Check if this is truly in-place rotation
+      bool isInPlaceRotation = false;
+      if (accumDist < inPlaceRotThreshold * 0.5)
+      {
+        // Very small total displacement - check yaw change
+        double yawChange = (lookAheadIdx > i) ? fabs(wrapAngle(pathYaw[lookAheadIdx] - pathYaw[i])) : 0.0;
+        if (yawChange > rotateYawThreDeg * PI / 180.0)
+        {
+          isInPlaceRotation = true;
+        }
+      }
+
+      if (isInPlaceRotation)
+      {
+        pathDir[i] = 0;  // In-place rotation
+      }
+      else if (accumDist > 1e-4)
+      {
+        // Sufficient displacement - determine direction
+        double motionYaw = atan2(totalDy, totalDx);
+        double pathYawLocal = pathYaw[i];
+        double headingDiff = wrapAngle(pathYawLocal - motionYaw);
+
+        // If path yaw points backward relative to motion, this is a reverse segment
+        if (fabs(headingDiff) > PI / 2)
+        {
+          pathDir[i] = -1;  // Reverse
+        }
+        else
+        {
+          pathDir[i] = 1;   // Forward
+        }
+      }
+      else
+      {
+        // No displacement, inherit from previous or default to forward
+        pathDir[i] = (i > 0) ? pathDir[i - 1] : 1;
+      }
+    }
+
     // unwrap yaw for smooth interpolation
     for (int i = 1; i < pathSize; i++)
     {
@@ -267,13 +386,41 @@ void pathHandler(const nav_msgs::Path::ConstPtr &pathIn)
   }
   else
   {
-    computePathYawAndS();
+    computePathYawAndDirection();
   }
   pathInit = true;
   pathJustUpdated = true;
+
+  // Debug output - show overall path statistics
+  int forwardCount = 0, reverseCount = 0, rotateCount = 0;
+  for (int i = 0; i < pathSize; i++)
+  {
+    if (pathDir[i] == 1) forwardCount++;
+    else if (pathDir[i] == -1) reverseCount++;
+    else if (pathDir[i] == 0) rotateCount++;
+  }
+
+  double pathLength = pathS.empty() ? 0.0 : pathS.back();
+  ROS_INFO("\033[36mPath updated: %d points, length=%.2fm, dirs: fwd=%d rev=%d rot=%d\033[0m",
+           pathSize, pathLength, forwardCount, reverseCount, rotateCount);
+
+  // Show first few points with detailed debug
+  for (int i = 0; i < std::min(5, pathSize); i++)
+  {
+    const char* dirStr = (pathDir[i] == 1) ? "fwd" : (pathDir[i] == -1) ? "rev" : "rot";
+    ROS_INFO("  [%d] dir=%s yaw=%.2f pos=(%.2f,%.2f)", i, dirStr, pathYaw[i], pathX[i], pathY[i]);
+  }
+
+  // Additional debug: show raw quaternion of first point
+  if (pathSize > 0)
+  {
+    const auto &q = pathIn->poses[0].pose.orientation;
+    ROS_INFO("  First point raw quat: x=%.3f y=%.3f z=%.3f w=%.3f (yaw=%.3f)",
+             q.x, q.y, q.z, q.w, tf::getYaw(q));
+  }
 }
 
-static void samplePathByS(double s, double &x, double &y, double &yaw)
+static void samplePathByS(double s, double &x, double &y, double &yaw, int &dir)
 {
   const int n = static_cast<int>(pathS.size());
   if (n <= 1)
@@ -281,6 +428,7 @@ static void samplePathByS(double s, double &x, double &y, double &yaw)
     x = pathX.empty() ? 0.0 : pathX[0];
     y = pathY.empty() ? 0.0 : pathY[0];
     yaw = pathYaw.empty() ? 0.0 : pathYaw[0];
+    dir = pathDir.empty() ? 1 : pathDir[0];
     return;
   }
   if (s <= pathS.front())
@@ -288,6 +436,7 @@ static void samplePathByS(double s, double &x, double &y, double &yaw)
     x = pathX.front();
     y = pathY.front();
     yaw = pathYaw.front();
+    dir = pathDir.front();
     return;
   }
   if (s >= pathS.back())
@@ -295,6 +444,7 @@ static void samplePathByS(double s, double &x, double &y, double &yaw)
     x = pathX.back();
     y = pathY.back();
     yaw = pathYaw.back();
+    dir = pathDir.back();
     return;
   }
   int idx = 0;
@@ -305,6 +455,7 @@ static void samplePathByS(double s, double &x, double &y, double &yaw)
   x = pathX[idx] * (1.0 - t) + pathX[idx + 1] * t;
   y = pathY[idx] * (1.0 - t) + pathY[idx + 1] * t;
   yaw = pathYaw[idx] * (1.0 - t) + pathYaw[idx + 1] * t;
+  dir = pathDir[idx];  // Use discrete direction of nearest segment
 }
 
 struct QPSolution
@@ -313,19 +464,17 @@ struct QPSolution
   std::vector<double> uk; // size NU*N
 };
 
+// **MODIFIED: Unified MPCC solver with direction guidance**
 static bool solveMpccQp(
     const std::vector<double> &x0,
     const std::vector<double> &s_guess,
     int N,
     double dt,
-    double qVsEff,
-    double vsMinEff,
-    double vsMaxEff,
-    int gearSign,
+    double prevVsSign,
     QPSolution &sol)
 {
-  const int NX = 4;
-  const int NU = 4;
+  const int NX = 4;  // [x, y, yaw, s]
+  const int NU = 4;  // [vx, vy, w, vs]
 
   std::vector<int> nx(N + 1, NX);
   std::vector<int> nu(N + 1, NU);
@@ -365,10 +514,14 @@ static bool solveMpccQp(
     r[k].assign(NU, 0.0);
   }
 
+  // **NEW: Track cumulative vs for gear switch penalty**
+  double cumulativeVs = 0.0;
+
   for (int k = 0; k <= N; k++)
   {
     double x_ref = 0.0, y_ref = 0.0, yaw_ref = 0.0;
-    samplePathByS(s_guess[k], x_ref, y_ref, yaw_ref);
+    int dir_ref = 1;
+    samplePathByS(s_guess[k], x_ref, y_ref, yaw_ref, dir_ref);
 
     // Wrap yaw_ref to [-pi, pi] to avoid accumulation issues
     yaw_ref = wrapAngle(yaw_ref);
@@ -388,18 +541,22 @@ static bool solveMpccQp(
     const double wL = (k == N) ? qL_f : qL;
     const double wYaw = (k == N) ? qYaw_f : qYaw;
 
+    // **MODIFIED: For in-place rotation segments, heavily penalize lag error**
+    const double wC_eff = (dir_ref == 0) ? wC * 10.0 : wC;  // Increase contour weight for rotation
+    const double wL_eff = (dir_ref == 0) ? wL * 0.1 : wL;   // Decrease lag weight for rotation
+
     // Q for x,y from contour/lag errors
-    const double qxx = 2.0 * (wC * a_cx * a_cx + wL * a_lx * a_lx);
-    const double qxy = 2.0 * (wC * a_cx * a_cy + wL * a_lx * a_ly);
-    const double qyy = 2.0 * (wC * a_cy * a_cy + wL * a_ly * a_ly);
+    const double qxx = 2.0 * (wC_eff * a_cx * a_cx + wL_eff * a_lx * a_lx);
+    const double qxy = 2.0 * (wC_eff * a_cx * a_cy + wL_eff * a_lx * a_ly);
+    const double qyy = 2.0 * (wC_eff * a_cy * a_cy + wL_eff * a_ly * a_ly);
 
     Q[k][0 + 0 * NX] += qxx;
     Q[k][0 + 1 * NX] += qxy;
     Q[k][1 + 0 * NX] += qxy;
     Q[k][1 + 1 * NX] += qyy;
 
-    q[k][0] += 2.0 * (wC * b_c * a_cx + wL * b_l * a_lx);
-    q[k][1] += 2.0 * (wC * b_c * a_cy + wL * b_l * a_ly);
+    q[k][0] += 2.0 * (wC_eff * b_c * a_cx + wL_eff * b_l * a_lx);
+    q[k][1] += 2.0 * (wC_eff * b_c * a_cy + wL_eff * b_l * a_ly);
 
     // yaw tracking
     Q[k][2 + 2 * NX] += 2.0 * wYaw;
@@ -407,11 +564,46 @@ static bool solveMpccQp(
 
     if (k < N)
     {
-      R[k][0 + 0 * NU] += 2.0 * rVx;
-      R[k][1 + 1 * NU] += 2.0 * rVy;
+      // **MODIFIED: Reduce control penalty for in-place rotation**
+      const double rVxEff = (dir_ref == 0) ? rVx * rInPlaceRot : rVx;
+      const double rVyEff = (dir_ref == 0) ? rVy * rInPlaceRot : rVy;
+      const double rVsEff = (dir_ref == 0) ? rVs * rInPlaceRot : rVs;
+
+      R[k][0 + 0 * NU] += 2.0 * rVxEff;
+      R[k][1 + 1 * NU] += 2.0 * rVyEff;
       R[k][2 + 2 * NU] += 2.0 * rW;
-      R[k][3 + 3 * NU] += 2.0 * rVs;
-      r[k][3] += -qVsEff;
+      R[k][3 + 3 * NU] += 2.0 * rVsEff;
+
+      // **NEW: Direction guidance - encourage vs to match path direction**
+      if (usePathDirectionHint && dir_ref != 0)
+      {
+        // Add linear term to encourage vs * dir_ref > 0
+        // Cost = -qVsDir * dir_ref * vs = vs * (-qVsDir * dir_ref)
+        r[k][3] += -qVsDir * static_cast<double>(dir_ref);
+      }
+      else if (dir_ref == 0)
+      {
+        // For in-place rotation, discourage linear motion
+        r[k][3] += -qVs * 0.1;  // Small progress reward
+      }
+      else
+      {
+        // No direction hint, use standard progress reward
+        r[k][3] += -qVs;
+      }
+
+      // **NEW: Gear switch penalty - penalize sign change of vs**
+      // Approximate with quadratic: vs^2 if sign(vs) != prevVsSign
+      // This is a simplified heuristic; proper implementation needs MIQP
+      if (k == 0)
+      {
+        double expectedSign = (dir_ref != 0) ? static_cast<double>(dir_ref) : prevVsSign;
+        if (expectedSign * prevVsSign < 0)
+        {
+          // Expecting to switch gears - add penalty
+          R[k][3 + 3 * NU] += 2.0 * qGearSwitch;
+        }
+      }
     }
   }
 
@@ -427,11 +619,12 @@ static bool solveMpccQp(
     ubx[0][i] = x0[i];
   }
 
+  // **MODIFIED: Allow full bidirectional vs range**
   for (int k = 0; k < N; k++)
   {
     idxbu[k] = {0, 1, 2, 3};
-    lbu[k] = {-vxMax, -vyMax, -wMax, vsMinEff};
-    ubu[k] = {vxMax, vyMax, wMax, vsMaxEff};
+    lbu[k] = {-vxMax, -vyMax, -wMax, vsMin};  // vsMin can be negative
+    ubu[k] = {vxMax, vyMax, wMax, vsMax};
   }
 
   // set hpipm pointers
@@ -484,7 +677,6 @@ static bool solveMpccQp(
   void *qp_mem = malloc(qp_size);
   struct d_ocp_qp qp;
   d_ocp_qp_create(&dim, &qp, qp_mem);
-  // Use NULL for unused constraints instead of arrays of nullptr
   d_ocp_qp_set_all(hA.data(), hB.data(), hb.data(),
                    hQ.data(), hS.data(), hR.data(), hq.data(), hr.data(),
                    hidxbx.data(), hlbx.data(), hubx.data(),
@@ -566,7 +758,7 @@ int main(int argc, char **argv)
   nhPrivate.param("vy_max", vyMax, 1.0);
   nhPrivate.param("w_max", wMax, 0.5);
   nhPrivate.param("vs_max", vsMax, 1.0);
-  nhPrivate.param("vs_min", vsMin, 0.0);
+  nhPrivate.param("vs_min", vsMin, -1.0);
   nhPrivate.param("s_trust", sTrust, 1.0);
   nhPrivate.param("qC", qC, 20.0);
   nhPrivate.param("qL", qL, 5.0);
@@ -579,6 +771,9 @@ int main(int argc, char **argv)
   nhPrivate.param("rW", rW, 1.0);
   nhPrivate.param("rVs", rVs, 0.5);
   nhPrivate.param("qVs", qVs, 0.2);
+  nhPrivate.param("qVsDir", qVsDir, 5.0);
+  nhPrivate.param("qGearSwitch", qGearSwitch, 10.0);
+  nhPrivate.param("rInPlaceRot", rInPlaceRot, 0.1);
   nhPrivate.param("stop_dis_thre", stopDisThre, 0.2);
   nhPrivate.param("align_dist_thre", alignDistThre, alignDistThre);
   nhPrivate.param("align_pos_thre", alignPosThre, alignPosThre);
@@ -586,12 +781,8 @@ int main(int argc, char **argv)
   nhPrivate.param("align_yaw_thre_deg", alignYawThreDeg, alignYawThreDeg);
   nhPrivate.param("align_yaw_speed", alignYawSpeed, alignYawSpeed);
   nhPrivate.param("align_timeout_s", alignTimeoutS, alignTimeoutS);
-  nhPrivate.param("gear_auto_enable", gearAutoEnable, gearAutoEnable);
-  nhPrivate.param("rotate_path_len_thre", rotatePathLenThre, rotatePathLenThre);
-  nhPrivate.param("rotate_ds_thre", rotateDsThre, rotateDsThre);
-  nhPrivate.param("rotate_yaw_thre_deg", rotateYawThreDeg, rotateYawThreDeg);
-  nhPrivate.param("rotate_yaw_kp", rotateYawKp, rotateYawKp);
-  nhPrivate.param("rotate_w_max", rotateWMax, rotateWMax);
+  nhPrivate.param("use_path_direction_hint", usePathDirectionHint, usePathDirectionHint);
+  nhPrivate.param("in_place_rot_threshold", inPlaceRotThreshold, inPlaceRotThreshold);
 
   ros::Subscriber subOdom = nh.subscribe<nav_msgs::Odometry>(ODOM_TOPIC, 5, odomHandler);
   ros::Subscriber subPath = nh.subscribe<nav_msgs::Path>("/local_path", 5, pathHandler);
@@ -750,89 +941,31 @@ int main(int argc, char **argv)
           }
           double s0 = pathS.empty() ? 0.0 : pathS[bestIdx];
 
-          int gearSign = 1;
-          bool rotateGear = false;
-          double vsMinEff = vsMin;
-          double vsMaxEff = vsMax;
-          double qVsEff = qVs;
-          if (gearAutoEnable && !pathYaw.empty())
-          {
-            const double pathYawRef = pathYaw[bestIdx];
-            const double headingErr = wrapAngle(pathYawRef - vehicleYawRel);
-            gearSign = (cos(headingErr) >= 0.0) ? 1 : -1;
-
-            if (!pathS.empty() && pathS.back() < rotatePathLenThre)
-            {
-              rotateGear = true;
-            }
-            else if (bestIdx + 1 < pathSize)
-            {
-              const double ds = hypot(pathX[bestIdx + 1] - pathX[bestIdx],
-                                      pathY[bestIdx + 1] - pathY[bestIdx]);
-              if (ds < rotateDsThre && fabs(headingErr) * 180.0 / PI > rotateYawThreDeg)
-              {
-                rotateGear = true;
-              }
-            }
-          }
-
-          if (rotateGear && !pathYaw.empty())
-          {
-            const double yawErr = wrapAngle(pathYaw[bestIdx] - vehicleYawRel);
-            vxCmd = 0.0;
-            vyCmd = 0.0;
-            wCmd = clampVal(rotateYawKp * yawErr, -rotateWMax, rotateWMax);
-            ROS_INFO_THROTTLE(1.0, "\033[36mgear=rotate\033[0m");
-          }
-          else
-          {
-            if (gearSign > 0)
-            {
-              vsMinEff = std::max(0.0, vsMin);
-              vsMaxEff = vsMax;
-            }
-            else
-            {
-              vsMinEff = vsMin;
-              vsMaxEff = std::min(0.0, vsMax);
-            }
-            qVsEff = qVs * static_cast<double>(gearSign);
-            ROS_INFO_THROTTLE(1.0, "\033[36mgear=%s\033[0m", (gearSign > 0) ? "forward" : "reverse");
-
+          // **MODIFIED: Remove manual gear selection, let optimizer decide**
           int N = std::max(1, mpcHorizon);
           vector<double> s_guess(N + 1, s0);
-          if (gearSign > 0)
-          {
-            double step_s = std::max(0.0, vsMinEff) * mpcDt;
-            for (int k = 1; k <= N; k++)
-              s_guess[k] = s_guess[k - 1] + std::max(step_s, 0.05);
-          }
-          else
-          {
-            double step_s = std::min(0.0, vsMinEff) * mpcDt;
-            for (int k = 1; k <= N; k++)
-              s_guess[k] = s_guess[k - 1] + std::min(step_s, -0.05);
-          }
+
+          // Simple initialization: assume constant progress
+          double step_s = 0.1;  // Small default step
+          for (int k = 1; k <= N; k++)
+            s_guess[k] = s_guess[k - 1] + step_s;
+
           if (!last_s_guess.empty() && static_cast<int>(last_s_guess.size()) == N + 1 && !pathJustUpdated)
           {
+            // Use previous solution as warm start
             s_guess = last_s_guess;
             s_guess[0] = s0;
-            if (gearSign > 0)
+            // Ensure monotonicity (can go forward or backward)
+            for (int k = 1; k <= N; k++)
             {
-              for (int k = 1; k <= N; k++)
-                s_guess[k] = std::max(s_guess[k], s_guess[k - 1]);
-            }
-            else
-            {
-              for (int k = 1; k <= N; k++)
-                s_guess[k] = std::min(s_guess[k], s_guess[k - 1]);
+              // No hard constraint, let optimizer decide
             }
           }
           pathJustUpdated = false;
 
           vector<double> x0 = {vehicleXRel, vehicleYRel, vehicleYawRel, s0};
           QPSolution sol;
-          if (solveMpccQp(x0, s_guess, N, mpcDt, qVsEff, vsMinEff, vsMaxEff, gearSign, sol))
+          if (solveMpccQp(x0, s_guess, N, mpcDt, lastVsSign, sol))
           {
             double speedScale = std::max(0.0f, std::min(1.0f, joySpeed));
             if (autonomyMode && joySpeedRaw == 0)
@@ -842,8 +975,16 @@ int main(int argc, char **argv)
             vxCmd = sol.uk[0] * speedScale;
             vyCmd = sol.uk[1] * speedScale;
             wCmd = sol.uk[2] * speedScale;
-            ROS_INFO_THROTTLE(1.0, "\033[36mmpcc cmd: vx=%.3f vy=%.3f w=%.3f\033[0m",
-                              vxCmd, vyCmd, wCmd);
+            double vs = sol.uk[3];
+
+            // **NEW: Update last direction for gear switch penalty**
+            if (fabs(vs) > 0.01)
+            {
+              lastVsSign = (vs > 0) ? 1.0 : -1.0;
+            }
+
+            ROS_INFO_THROTTLE(1.0, "\033[36mmpcc cmd: vx=%.3f vy=%.3f w=%.3f vs=%.3f dir=%s\033[0m",
+                              vxCmd, vyCmd, wCmd, vs, (vs >= 0) ? "forward" : "reverse");
             last_s_guess.resize(N + 1);
             for (int k = 0; k <= N; k++)
               last_s_guess[k] = sol.xk[k * 4 + 3];
@@ -867,7 +1008,6 @@ int main(int argc, char **argv)
           else
           {
             ROS_WARN_THROTTLE(1.0, "mpcc solve failed");
-          }
           }
         }
       }

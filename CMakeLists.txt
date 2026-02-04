@@ -19,7 +19,7 @@ find_package(catkin REQUIRED COMPONENTS
   pcl_ros
   pcl_conversions
   tf
-  yhs_can_msgs
+  # yhs_can_msgs
 )
 
 find_package(PCL REQUIRED)
@@ -163,6 +163,7 @@ link_directories(
 add_executable(localPlanner src/localPlanner.cpp)
 add_executable(pathFollower src/pathFollower.cpp)
 add_executable(mpccfollower src/mpccfollower.cpp)
+add_executable(mpccfollower_unified src/mpccfollower_unified.cpp)
 
 ## Specify libraries to link a library or executable target against
 target_link_libraries(localPlanner ${catkin_LIBRARIES} ${PCL_LIBRARIES})
@@ -174,8 +175,15 @@ target_link_libraries(mpccfollower
   ${BLASFEO_LIB}
   m
 )
+target_link_libraries(mpccfollower_unified
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+  ${HPIPM_LIB}
+  ${BLASFEO_LIB}
+  m
+)
 
-install(TARGETS localPlanner pathFollower mpccfollower
+install(TARGETS localPlanner pathFollower mpccfollower mpccfollower_unified
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
