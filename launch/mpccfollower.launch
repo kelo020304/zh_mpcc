@@ -1,0 +1,11 @@
+<launch>
+  <node pkg="local_planner" type="mpccfollower" name="mpccfollower" output="screen" required="true">
+    <rosparam command="load" file="$(find local_planner)/config/mpccfollower.yaml" />
+  </node>
+
+  <node pkg="local_planner" type="mpcc_pred_visualizer.py" name="mpcc_pred_visualizer" output="screen">
+    <param name="pred_topic" value="/mpcc_pred_path"/>
+    <param name="odom_topic" value="/localization"/>
+    <param name="marker_topic" value="/mpcc_pred_marker"/>
+  </node>
+</launch>
