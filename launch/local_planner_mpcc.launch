@@ -68,18 +68,8 @@
     <param name="goalClearRange" type="double" value="0.5" />
     <param name="goalX" type="double" value="$(arg goalX)" />
     <param name="goalY" type="double" value="$(arg goalY)" />
-    <!-- 对齐逻辑配置（支持直线和曲线两种模式） -->
-    <param name="reach_goal_thre_g" type="double" value="$(arg reach_goal_thre_g)" />  <!-- 触发对齐的距离阈值 [m] -->
-    <param name="align_at_goal" type="bool" value="true" />                            <!-- 是否在目标点进行航向对齐 -->
-    <param name="align_pos_thre_g" type="double" value="0.05" />                       <!-- 对齐完成的位置阈值 [m] -->
-    <param name="align_yaw_thre_deg" type="double" value="3.0" />                      <!-- 对齐完成的航向阈值 [度] -->
-    <param name="align_path_points" type="int" value="60" />                           <!-- 对齐路径点数（增加到 60，更密集） -->
-    <param name="align_max_speed" type="double" value="0.10" />                        <!-- 对齐阶段最大速度 [m/s]（降低到 0.10） -->
-    <param name="align_use_straight_path" type="bool" value="true" />                  <!-- 使用直线路径（利用全向能力） -->
-    <!-- 以下参数仅在 align_use_straight_path=false 时生效 -->
-    <param name="align_ctrl_scale" type="double" value="1.0" />                        <!-- Hermite 切线长度缩放 -->
-    <param name="align_ctrl_min" type="double" value="0.3" />                          <!-- 切线最小长度 [m] -->
-    <param name="align_ctrl_max" type="double" value="1.5" />                          <!-- 切线最大长度 [m] -->
+    <!-- 末端对齐不在 localPlanner 中处理，仅用 reach_goal_thre_g 作为位置到达阈值 -->
+    <param name="reach_goal_thre_g" type="double" value="$(arg reach_goal_thre_g)" />  <!-- 位置到达阈值 [m] -->
   </node>
 
   <!-- mpcc follower (tracking) -->

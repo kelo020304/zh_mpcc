@@ -56,12 +56,33 @@ double maxSpeed = 1.0;
 bool autonomyMode = false;
 double autonomySpeed = 1.0;
 double joyToSpeedDelay = 2.0;
+double alignDistThre = 0.5;
+double alignPosThre = 0.05;
+double alignPosSpeed = 0.05;
+double alignYawThreDeg = 10.0;
+double alignYawSpeed = 0.3;
+double alignTimeoutS = 8.0;
+
+bool gearAutoEnable = true;
+double rotatePathLenThre = 0.05;
+double rotateDsThre = 0.02;
+double rotateYawThreDeg = 20.0;
+double rotateYawKp = 2.0;
+double rotateWMax = 1.0;
+
+// cmd smoothing
+bool enableCmdSmoothing = false;
+double cmdSmoothTau = 0.2;   // seconds
+double cmdMaxAccelLin = 1.5; // m/s^2
+double cmdMaxAccelAng = 2.0; // rad/s^2
+std::string chassisType = "omni";
 
 float joySpeed = 0;
 float joySpeedRaw = 0;
 double joyTime = 0;
 int safetyStop = 0;
 bool goalReached = false;
+bool goal_reached_pub = false;
 
 double goalYaw = 0.0;
 double goalX = 0.0;
@@ -88,6 +109,15 @@ std::vector<double> pathX;
 std::vector<double> pathY;
 std::vector<double> pathYaw;
 std::vector<double> pathS;
+
+static geometry_msgs::Twist targetCmd;
+static geometry_msgs::Twist lastCmd;
+static double lastCmdTime = 0.0;
+
+static ros::Publisher pubGoalReached;
+static double align_start_time = 0.0;
+static bool align_mode_active = false;
+static bool align_log_pending = false;
 
 inline double clampVal(double v, double lo, double hi)
 {
@@ -132,11 +162,7 @@ void stopHandler(const std_msgs::Int8::ConstPtr &stop)
 void goalReachedHandler(const std_msgs::Bool::ConstPtr &msg)
 {
   goalReached = msg->data;
-  if (!goalReached)
-  {
-    hasGoalPos = false;
-    hasGoalYaw = false;
-  }
+  if (!goalReached) goal_reached_pub = false;
 }
 
 void goalHandler(const geometry_msgs::PoseStamped::ConstPtr &goal)
@@ -149,11 +175,23 @@ void goalHandler(const geometry_msgs::PoseStamped::ConstPtr &goal)
       goal->pose.orientation.y,
       goal->pose.orientation.z,
       goal->pose.orientation.w);
-  tf::Matrix3x3 m(q);
-  double roll, pitch, yaw;
-  m.getRPY(roll, pitch, yaw);
-  goalYaw = yaw;
-  hasGoalYaw = true;
+  const double qn = sqrt(q.x() * q.x() + q.y() * q.y() + q.z() * q.z() + q.w() * q.w());
+  if (!isfinite(qn) || qn < 1e-3)
+  {
+    hasGoalYaw = false;
+    ROS_INFO("\033[36minvalid goal yaw, skip yaw align\033[0m");
+  }
+  else
+  {
+    if (fabs(qn - 1.0) > 1e-3) q = q / qn;
+    tf::Matrix3x3 m(q);
+    double roll, pitch, yaw;
+    m.getRPY(roll, pitch, yaw);
+    goalYaw = yaw;
+    hasGoalYaw = true;
+  }
+  align_start_time = 0.0;
+  align_mode_active = false;
 }
 
 static void computePathYawAndS()
@@ -187,18 +225,50 @@ void pathHandler(const nav_msgs::Path::ConstPtr &pathIn)
   path.poses.resize(pathSize);
   pathX.resize(pathSize);
   pathY.resize(pathSize);
+  pathYaw.resize(pathSize);
+  pathS.resize(pathSize);
 
+  bool anyYaw = false;
   for (int i = 0; i < pathSize; i++)
   {
     pathX[i] = pathIn->poses[i].pose.position.x;
     pathY[i] = pathIn->poses[i].pose.position.y;
+
+    const auto &q = pathIn->poses[i].pose.orientation;
+    double yaw = tf::getYaw(q);
+    pathYaw[i] = yaw;
+    if (std::fabs(yaw) > 1e-3 || std::fabs(q.x) > 1e-6 || std::fabs(q.y) > 1e-6 || std::fabs(q.z) > 1e-6 || std::fabs(q.w - 1.0) > 1e-6)
+    {
+      anyYaw = true;
+    }
   }
 
   vehicleXRec = vehicleX;
   vehicleYRec = vehicleY;
   vehicleYawRec = vehicleYaw;
 
-  computePathYawAndS();
+  const bool usePathOrientation = (chassisType == "omni" || chassisType == "holonomic");
+  if (usePathOrientation && anyYaw)
+  {
+    pathS[0] = 0.0;
+    for (int i = 1; i < pathSize; i++)
+    {
+      double dx = pathX[i] - pathX[i - 1];
+      double dy = pathY[i] - pathY[i - 1];
+      double ds = hypot(dx, dy);
+      pathS[i] = pathS[i - 1] + ds;
+    }
+    // unwrap yaw for smooth interpolation
+    for (int i = 1; i < pathSize; i++)
+    {
+      double dyaw = wrapAngle(pathYaw[i] - pathYaw[i - 1]);
+      pathYaw[i] = pathYaw[i - 1] + dyaw;
+    }
+  }
+  else
+  {
+    computePathYawAndS();
+  }
   pathInit = true;
   pathJustUpdated = true;
 }
@@ -248,6 +318,10 @@ static bool solveMpccQp(
     const std::vector<double> &s_guess,
     int N,
     double dt,
+    double qVsEff,
+    double vsMinEff,
+    double vsMaxEff,
+    int gearSign,
     QPSolution &sol)
 {
   const int NX = 4;
@@ -337,7 +411,7 @@ static bool solveMpccQp(
       R[k][1 + 1 * NU] += 2.0 * rVy;
       R[k][2 + 2 * NU] += 2.0 * rW;
       R[k][3 + 3 * NU] += 2.0 * rVs;
-      r[k][3] += -qVs;
+      r[k][3] += -qVsEff;
     }
   }
 
@@ -356,8 +430,8 @@ static bool solveMpccQp(
   for (int k = 0; k < N; k++)
   {
     idxbu[k] = {0, 1, 2, 3};
-    lbu[k] = {-vxMax, -vyMax, -wMax, vsMin};
-    ubu[k] = {vxMax, vyMax, wMax, vsMax};
+    lbu[k] = {-vxMax, -vyMax, -wMax, vsMinEff};
+    ubu[k] = {vxMax, vyMax, wMax, vsMaxEff};
   }
 
   // set hpipm pointers
@@ -483,6 +557,11 @@ int main(int argc, char **argv)
   nhPrivate.param("autonomyMode", autonomyMode, false);
   nhPrivate.param("autonomySpeed", autonomySpeed, 1.0);
   nhPrivate.param("joyToSpeedDelay", joyToSpeedDelay, 2.0);
+  nhPrivate.param("enable_cmd_smoothing", enableCmdSmoothing, enableCmdSmoothing);
+  nhPrivate.param("cmd_smooth_tau", cmdSmoothTau, cmdSmoothTau);
+  nhPrivate.param("cmd_max_accel_lin", cmdMaxAccelLin, cmdMaxAccelLin);
+  nhPrivate.param("cmd_max_accel_ang", cmdMaxAccelAng, cmdMaxAccelAng);
+  nhPrivate.param("chassis_type", chassisType, chassisType);
   nhPrivate.param("vx_max", vxMax, 1.0);
   nhPrivate.param("vy_max", vyMax, 1.0);
   nhPrivate.param("w_max", wMax, 0.5);
@@ -501,6 +580,18 @@ int main(int argc, char **argv)
   nhPrivate.param("rVs", rVs, 0.5);
   nhPrivate.param("qVs", qVs, 0.2);
   nhPrivate.param("stop_dis_thre", stopDisThre, 0.2);
+  nhPrivate.param("align_dist_thre", alignDistThre, alignDistThre);
+  nhPrivate.param("align_pos_thre", alignPosThre, alignPosThre);
+  nhPrivate.param("align_pos_speed", alignPosSpeed, alignPosSpeed);
+  nhPrivate.param("align_yaw_thre_deg", alignYawThreDeg, alignYawThreDeg);
+  nhPrivate.param("align_yaw_speed", alignYawSpeed, alignYawSpeed);
+  nhPrivate.param("align_timeout_s", alignTimeoutS, alignTimeoutS);
+  nhPrivate.param("gear_auto_enable", gearAutoEnable, gearAutoEnable);
+  nhPrivate.param("rotate_path_len_thre", rotatePathLenThre, rotatePathLenThre);
+  nhPrivate.param("rotate_ds_thre", rotateDsThre, rotateDsThre);
+  nhPrivate.param("rotate_yaw_thre_deg", rotateYawThreDeg, rotateYawThreDeg);
+  nhPrivate.param("rotate_yaw_kp", rotateYawKp, rotateYawKp);
+  nhPrivate.param("rotate_w_max", rotateWMax, rotateWMax);
 
   ros::Subscriber subOdom = nh.subscribe<nav_msgs::Odometry>(ODOM_TOPIC, 5, odomHandler);
   ros::Subscriber subPath = nh.subscribe<nav_msgs::Path>("/local_path", 5, pathHandler);
@@ -511,6 +602,7 @@ int main(int argc, char **argv)
 
   ros::Publisher pubSpeed = nh.advertise<geometry_msgs::Twist>("/cmd_vel", 5);
   ros::Publisher yhs_ctrl_pub = nh.advertise<yhs_can_msgs::ctrl_cmd>("/ctrl_cmd", 1);
+  pubGoalReached = nh.advertise<std_msgs::Bool>("/goal_reached", 1, true);
 
   ros::Publisher pubPred = nh.advertise<nav_msgs::Path>("/mpcc_pred_path", 5);
 
@@ -531,8 +623,98 @@ int main(int argc, char **argv)
       double vxCmd = 0.0;
       double vyCmd = 0.0;
       double wCmd = 0.0;
+      bool alignActive = false;
 
-      if (pathInit && !pathX.empty())
+      if (hasGoalPos && hasGoalYaw)
+      {
+        double dxg = goalX - vehicleX;
+        double dyg = goalY - vehicleY;
+        double goalDis = sqrt(dxg * dxg + dyg * dyg);
+        if (goalDis <= alignDistThre)
+        {
+          alignActive = true;
+          if (!align_mode_active)
+          {
+            align_mode_active = true;
+            align_start_time = odomTime;
+            align_log_pending = true;
+          }
+          const double yawErr = wrapAngle(goalYaw - vehicleYaw);
+          const double yawErrDeg = fabs(yawErr) * 180.0 / PI;
+          const double goalYawDeg = goalYaw * 180.0 / PI;
+          const double vehicleYawDeg = vehicleYaw * 180.0 / PI;
+          auto log_align_status = [&](const char *tag) {
+            ROS_INFO("\033[36malign status%s: goalDis=%.3f yawErrDeg=%.1f vx=%.3f vy=%.3f w=%.3f "
+                     "goalYawDeg=%.1f vehicleYawDeg=%.1f safetyStop=%d\033[0m",
+                     tag, goalDis, yawErrDeg, vxCmd, vyCmd, wCmd, goalYawDeg, vehicleYawDeg, safetyStop);
+          };
+
+          const bool alignTimeout =
+              (alignTimeoutS > 0.0) && ((odomTime - align_start_time) >= alignTimeoutS);
+          if (alignTimeout)
+          {
+            vxCmd = 0.0;
+            vyCmd = 0.0;
+            wCmd = 0.0;
+            log_align_status(" (final)");
+            if (!goal_reached_pub)
+            {
+              std_msgs::Bool msg;
+              msg.data = true;
+              pubGoalReached.publish(msg);
+              goal_reached_pub = true;
+              goalReached = true;
+              ROS_INFO("\033[36mall done (timeout)\033[0m");
+            }
+          }
+          else if (goalDis > alignPosThre)
+          {
+            double goalHeading = atan2(dyg, dxg);
+            double headingBody = wrapAngle(goalHeading - vehicleYaw);
+            vxCmd = alignPosSpeed * cos(headingBody);
+            vyCmd = alignPosSpeed * sin(headingBody);
+            wCmd = (yawErr > 0.0) ? alignYawSpeed : -alignYawSpeed;
+          }
+          else
+          {
+            if (yawErrDeg <= alignYawThreDeg)
+            {
+              vxCmd = 0.0;
+              vyCmd = 0.0;
+              wCmd = 0.0;
+              log_align_status(" (final)");
+              if (!goal_reached_pub)
+              {
+                std_msgs::Bool msg;
+                msg.data = true;
+                pubGoalReached.publish(msg);
+                goal_reached_pub = true;
+                goalReached = true;
+                ROS_INFO("\033[36mall done\033[0m");
+              }
+            }
+            else
+            {
+              vxCmd = 0.0;
+              vyCmd = 0.0;
+              wCmd = (yawErr > 0.0) ? alignYawSpeed : -alignYawSpeed;
+            }
+          }
+          if (align_log_pending)
+          {
+            log_align_status(" (start)");
+            align_log_pending = false;
+          }
+        }
+      }
+      if (!alignActive)
+      {
+        align_mode_active = false;
+        align_start_time = 0.0;
+        align_log_pending = false;
+      }
+
+      if (!alignActive && pathInit && !pathX.empty())
       {
         double vehicleXRel = cos(vehicleYawRec) * (vehicleX - vehicleXRec) + sin(vehicleYawRec) * (vehicleY - vehicleYRec);
         double vehicleYRel = -sin(vehicleYawRec) * (vehicleX - vehicleXRec) + cos(vehicleYawRec) * (vehicleY - vehicleYRec);
@@ -542,6 +724,8 @@ int main(int argc, char **argv)
         double endDx = pathX.back() - vehicleXRel;
         double endDy = pathY.back() - vehicleYRel;
         double endDis = sqrt(endDx * endDx + endDy * endDy);
+        ROS_INFO_THROTTLE(1.0, "\033[36mmpcc debug: pathSize=%d endDis=%.3f safetyStop=%d\033[0m",
+                          pathSize, endDis, safetyStop);
         if (pathSize <= 1 || endDis < stopDisThre)
         {
           vxCmd = 0.0;
@@ -566,25 +750,89 @@ int main(int argc, char **argv)
           }
           double s0 = pathS.empty() ? 0.0 : pathS[bestIdx];
 
+          int gearSign = 1;
+          bool rotateGear = false;
+          double vsMinEff = vsMin;
+          double vsMaxEff = vsMax;
+          double qVsEff = qVs;
+          if (gearAutoEnable && !pathYaw.empty())
+          {
+            const double pathYawRef = pathYaw[bestIdx];
+            const double headingErr = wrapAngle(pathYawRef - vehicleYawRel);
+            gearSign = (cos(headingErr) >= 0.0) ? 1 : -1;
+
+            if (!pathS.empty() && pathS.back() < rotatePathLenThre)
+            {
+              rotateGear = true;
+            }
+            else if (bestIdx + 1 < pathSize)
+            {
+              const double ds = hypot(pathX[bestIdx + 1] - pathX[bestIdx],
+                                      pathY[bestIdx + 1] - pathY[bestIdx]);
+              if (ds < rotateDsThre && fabs(headingErr) * 180.0 / PI > rotateYawThreDeg)
+              {
+                rotateGear = true;
+              }
+            }
+          }
+
+          if (rotateGear && !pathYaw.empty())
+          {
+            const double yawErr = wrapAngle(pathYaw[bestIdx] - vehicleYawRel);
+            vxCmd = 0.0;
+            vyCmd = 0.0;
+            wCmd = clampVal(rotateYawKp * yawErr, -rotateWMax, rotateWMax);
+            ROS_INFO_THROTTLE(1.0, "\033[36mgear=rotate\033[0m");
+          }
+          else
+          {
+            if (gearSign > 0)
+            {
+              vsMinEff = std::max(0.0, vsMin);
+              vsMaxEff = vsMax;
+            }
+            else
+            {
+              vsMinEff = vsMin;
+              vsMaxEff = std::min(0.0, vsMax);
+            }
+            qVsEff = qVs * static_cast<double>(gearSign);
+            ROS_INFO_THROTTLE(1.0, "\033[36mgear=%s\033[0m", (gearSign > 0) ? "forward" : "reverse");
+
           int N = std::max(1, mpcHorizon);
           vector<double> s_guess(N + 1, s0);
-          double step_s = std::max(0.0, vsMin) * mpcDt;
-          for (int k = 1; k <= N; k++)
+          if (gearSign > 0)
           {
-            s_guess[k] = s_guess[k - 1] + std::max(step_s, 0.05);
+            double step_s = std::max(0.0, vsMinEff) * mpcDt;
+            for (int k = 1; k <= N; k++)
+              s_guess[k] = s_guess[k - 1] + std::max(step_s, 0.05);
+          }
+          else
+          {
+            double step_s = std::min(0.0, vsMinEff) * mpcDt;
+            for (int k = 1; k <= N; k++)
+              s_guess[k] = s_guess[k - 1] + std::min(step_s, -0.05);
           }
           if (!last_s_guess.empty() && static_cast<int>(last_s_guess.size()) == N + 1 && !pathJustUpdated)
           {
             s_guess = last_s_guess;
             s_guess[0] = s0;
-            for (int k = 1; k <= N; k++)
-              s_guess[k] = std::max(s_guess[k], s_guess[k - 1]);
+            if (gearSign > 0)
+            {
+              for (int k = 1; k <= N; k++)
+                s_guess[k] = std::max(s_guess[k], s_guess[k - 1]);
+            }
+            else
+            {
+              for (int k = 1; k <= N; k++)
+                s_guess[k] = std::min(s_guess[k], s_guess[k - 1]);
+            }
           }
           pathJustUpdated = false;
 
           vector<double> x0 = {vehicleXRel, vehicleYRel, vehicleYawRel, s0};
           QPSolution sol;
-          if (solveMpccQp(x0, s_guess, N, mpcDt, sol))
+          if (solveMpccQp(x0, s_guess, N, mpcDt, qVsEff, vsMinEff, vsMaxEff, gearSign, sol))
           {
             double speedScale = std::max(0.0f, std::min(1.0f, joySpeed));
             if (autonomyMode && joySpeedRaw == 0)
@@ -594,6 +842,8 @@ int main(int argc, char **argv)
             vxCmd = sol.uk[0] * speedScale;
             vyCmd = sol.uk[1] * speedScale;
             wCmd = sol.uk[2] * speedScale;
+            ROS_INFO_THROTTLE(1.0, "\033[36mmpcc cmd: vx=%.3f vy=%.3f w=%.3f\033[0m",
+                              vxCmd, vyCmd, wCmd);
             last_s_guess.resize(N + 1);
             for (int k = 0; k <= N; k++)
               last_s_guess[k] = sol.xk[k * 4 + 3];
@@ -614,26 +864,24 @@ int main(int argc, char **argv)
             }
             pubPred.publish(predPathMsg);
           }
+          else
+          {
+            ROS_WARN_THROTTLE(1.0, "mpcc solve failed");
+          }
+          }
         }
       }
 
-      if (hasGoalPos && hasGoalYaw)
-      {
-        double dxg = goalX - vehicleX;
-        double dyg = goalY - vehicleY;
-        double goalDis = sqrt(dxg * dxg + dyg * dyg);
-        double goalYawErr = wrapAngle(vehicleYaw - goalYaw);
-        if (goalDis < stopDisThre && fabs(goalYawErr) < 0.3)
-        {
-          vxCmd = 0.0;
-          vyCmd = 0.0;
-          wCmd = 0.0;
-        }
-      }
+  if (goalReached)
+  {
+    vxCmd = 0.0;
+    vyCmd = 0.0;
+    wCmd = 0.0;
+  }
 
-      if (safetyStop >= 1)
-      {
-        vxCmd = 0.0;
+  if (safetyStop >= 1 && !alignActive)
+  {
+    vxCmd = 0.0;
         vyCmd = 0.0;
       }
       if (safetyStop >= 2)
@@ -641,18 +889,52 @@ int main(int argc, char **argv)
         wCmd = 0.0;
       }
 
-      cmd_vel.linear.x = vxCmd;
-      cmd_vel.linear.y = vyCmd;
-      cmd_vel.angular.z = wCmd;
-      pubSpeed.publish(cmd_vel);
-
-      yhs_can_msgs::ctrl_cmd yhs_cmd_vel;
-      yhs_cmd_vel.ctrl_cmd_gear = 6;
-      yhs_cmd_vel.ctrl_cmd_x_linear = cmd_vel.linear.x;    // 线速度
-      yhs_cmd_vel.ctrl_cmd_z_angular = cmd_vel.angular.z*57.29d;   // 角速度 (rad/s)
-      yhs_ctrl_pub.publish(yhs_cmd_vel);
+      targetCmd.linear.x = vxCmd;
+      targetCmd.linear.y = vyCmd;
+      targetCmd.angular.z = wCmd;
 
     }
+    // Publish smoothed command at loop rate
+    {
+      geometry_msgs::Twist cmd_out = targetCmd;
+      if (enableCmdSmoothing)
+      {
+        const double now = ros::Time::now().toSec();
+        double dt = now - lastCmdTime;
+        if (dt <= 0.0 || dt > 1.0)
+        {
+          dt = std::max(1e-3, 1.0 / 100.0);
+          lastCmdTime = now;
+          lastCmd = cmd_out;
+        }
+        else
+        {
+          const double alpha = clampVal(dt / (cmdSmoothTau + dt), 0.0, 1.0);
+          geometry_msgs::Twist filt = cmd_out;
+          filt.linear.x = lastCmd.linear.x + alpha * (cmd_out.linear.x - lastCmd.linear.x);
+          filt.linear.y = lastCmd.linear.y + alpha * (cmd_out.linear.y - lastCmd.linear.y);
+          filt.angular.z = lastCmd.angular.z + alpha * (cmd_out.angular.z - lastCmd.angular.z);
+
+          const double maxDv = cmdMaxAccelLin * dt;
+          const double maxDw = cmdMaxAccelAng * dt;
+          filt.linear.x = lastCmd.linear.x + clampVal(filt.linear.x - lastCmd.linear.x, -maxDv, maxDv);
+          filt.linear.y = lastCmd.linear.y + clampVal(filt.linear.y - lastCmd.linear.y, -maxDv, maxDv);
+          filt.angular.z = lastCmd.angular.z + clampVal(filt.angular.z - lastCmd.angular.z, -maxDw, maxDw);
+
+          cmd_out = filt;
+          lastCmd = cmd_out;
+          lastCmdTime = now;
+        }
+      }
+
+      pubSpeed.publish(cmd_out);
+      yhs_can_msgs::ctrl_cmd yhs_cmd_vel;
+      yhs_cmd_vel.ctrl_cmd_gear = 6;
+      yhs_cmd_vel.ctrl_cmd_x_linear = cmd_out.linear.x;
+      yhs_cmd_vel.ctrl_cmd_z_angular = cmd_out.angular.z * 57.29d;
+      yhs_ctrl_pub.publish(yhs_cmd_vel);
+    }
+
     rate.sleep();
   }
   return 0;

@@ -99,6 +99,8 @@ double nn_goal_y_in_map = 0.0;
 float reach_goal_thre_g = 0.2;
 float align_pos_thre_g = 0.2;
 float align_yaw_thre_deg = 5.0;
+float align_near_goal_dist = 1.0;     // 进入对齐逻辑的距离阈值 [m]
+float align_yaw_switch_deg = 30.0;    // 航向误差大于该值时先原地转再平移 [deg]
 int align_path_points = 20;
 float align_ctrl_scale = 0.6;
 float align_ctrl_min = 0.2;
@@ -106,6 +108,7 @@ float align_ctrl_max = 1.0;
 bool align_at_goal = true;
 float align_max_speed = 0.3;          // 对齐阶段最大速度 [m/s]
 bool align_use_straight_path = true;  // 使用直线路径（充分利用全向底盘横向平移能力）
+double align_timeout_s = 2.0;         // 对齐超时 [s]，到达位置后最长等待航向对齐时间
 
 float joySpeed = 0;
 float joySpeedRaw = 0;
@@ -160,8 +163,11 @@ bool newTerrainCloud = false; // 如果接收到新的地形点云，则设置�
 bool reach_goal_flag_g = true;
 ros::Publisher pubStop;
 ros::Publisher pubGoalReached;
+ros::Publisher pubGoalPosReached;
 bool goal_reached_pub = false;
 bool align_active = false;
+double align_start_time = 0.0;
+bool pos_reached_pub = false;
 
 // 时间记录:
 double odomTime = 0; // 记录最近一次接收到的里程计数据的时间戳。
@@ -243,12 +249,11 @@ static void buildAlignSplinePath(
 
   if (use_straight)
   {
-    // ========== 两阶段对齐：移动 + 原地旋转 ==========
-    // 阶段 1：直线移动到目标位置（完全忽略航向，充分利用全向能力）
-    // 阶段 2：原地旋转到目标航向（位置固定，只调整航向）
+    // ========== 两阶段对齐：原地旋转 + 侧向平移（顺序由航向误差决定） ==========
 
     // 计算需要旋转的角度
     const double yaw_diff = std::abs(wrapAngle(goal_yaw_b));  // 目标航向相对 body frame
+    const bool rotate_first = (yaw_diff * 180.0 / PI) > align_yaw_switch_deg;
 
     // 根据航向偏差决定旋转段的点数
     // 每 10° 分配约 5 个点，确保旋转平滑
@@ -261,48 +266,29 @@ static void buildAlignSplinePath(
 
     for (int i = 0; i < n; i++)
     {
-      if (i < final_move_points)
+      const bool is_move_segment = rotate_first ? (i >= final_rotate_points) : (i < final_move_points);
+      if (is_move_segment)
       {
         // ========== 阶段 1：移动段 ==========
         // 直线路径到目标位置，充分利用全向底盘 vx, vy
-        const double t = static_cast<double>(i) / static_cast<double>(std::max(1, final_move_points - 1));
+        const int move_idx = rotate_first ? (i - final_rotate_points) : i;
+        const double t = static_cast<double>(move_idx) / static_cast<double>(std::max(1, final_move_points - 1));
         out.poses[i].pose.position.x = t * goal_x_b;
         out.poses[i].pose.position.y = t * goal_y_b;
         out.poses[i].pose.position.z = 0.0;
+        out.poses[i].pose.orientation = tf::createQuaternionMsgFromYaw(goal_yaw_b);
       }
       else
       {
         // ========== 阶段 2：旋转段 ==========
         // 在目标位置原地旋转到目标航向
-        out.poses[i].pose.position.x = goal_x_b;
-        out.poses[i].pose.position.y = goal_y_b;
-        out.poses[i].pose.position.z = 0.0;
-      }
-
-      out.poses[i].pose.orientation.w = 1.0;
-    }
-
-    // 关键：为旋转段添加航向指示点
-    // mpccfollower 根据相邻点位置计算航向，所以我们需要在目标点周围构造一个小圆弧
-    // 让 mpccfollower 计算出正确的航向
-    if (final_rotate_points >= 2)
-    {
-      // 在目标点周围构造一个半径 2cm 的小圆弧
-      // 从当前航向（直线方向或 0）过渡到目标航向
-      const double arc_radius = 0.02;  // 2cm 半径
-
-      for (int i = 0; i < final_rotate_points; i++)
-      {
-        const int idx = final_move_points + i;
-        const double t = static_cast<double>(i) / static_cast<double>(final_rotate_points - 1);
-
-        // 航向从 0 线性插值到 goal_yaw_b
+        const int rot_idx = rotate_first ? i : (i - final_move_points);
+        const double t = static_cast<double>(rot_idx) / static_cast<double>(std::max(1, final_rotate_points - 1));
         const double current_yaw = t * goal_yaw_b;
-
-        // 在目标点周围构造小圆弧
-        out.poses[idx].pose.position.x = goal_x_b + arc_radius * std::cos(current_yaw);
-        out.poses[idx].pose.position.y = goal_y_b + arc_radius * std::sin(current_yaw);
-        out.poses[idx].pose.position.z = 0.0;
+        out.poses[i].pose.position.x = rotate_first ? 0.0 : goal_x_b;
+        out.poses[i].pose.position.y = rotate_first ? 0.0 : goal_y_b;
+        out.poses[i].pose.position.z = 0.0;
+        out.poses[i].pose.orientation = tf::createQuaternionMsgFromYaw(current_yaw);
       }
     }
   }
@@ -462,12 +448,20 @@ void goalHandler(const geometry_msgs::PoseStamped::ConstPtr &goal)  //仅处理�
   // goalY = -dx*sin(vehicleYaw_1) + dy*cos(vehicleYaw_1);
   reach_goal_flag_g = false;
   goal_reached_pub = false;
+  pos_reached_pub = false;
   align_active = false;
+  align_start_time = 0.0;
   if (pubGoalReached)
   {
     std_msgs::Bool msg;
     msg.data = false;
     pubGoalReached.publish(msg);
+  }
+  if (pubGoalPosReached)
+  {
+    std_msgs::Bool msg;
+    msg.data = false;
+    pubGoalPosReached.publish(msg);
   }
   if (pubStop)
   {
@@ -766,6 +760,8 @@ int main(int argc, char **argv)
   nhPrivate.param("reach_goal_thre_g", reach_goal_thre_g, reach_goal_thre_g);
   nhPrivate.param("align_pos_thre_g", align_pos_thre_g, align_pos_thre_g);
   nhPrivate.param("align_yaw_thre_deg", align_yaw_thre_deg, align_yaw_thre_deg);
+  nhPrivate.param("align_near_goal_dist", align_near_goal_dist, align_near_goal_dist);
+  nhPrivate.param("align_yaw_switch_deg", align_yaw_switch_deg, align_yaw_switch_deg);
   nhPrivate.param("align_path_points", align_path_points, align_path_points);
   nhPrivate.param("align_ctrl_scale", align_ctrl_scale, align_ctrl_scale);
   nhPrivate.param("align_ctrl_min", align_ctrl_min, align_ctrl_min);
@@ -773,6 +769,7 @@ int main(int argc, char **argv)
   nhPrivate.param("align_at_goal", align_at_goal, align_at_goal);
   nhPrivate.param("align_max_speed", align_max_speed, align_max_speed);
   nhPrivate.param("align_use_straight_path", align_use_straight_path, align_use_straight_path);
+  nhPrivate.param("align_timeout_s", align_timeout_s, align_timeout_s);
 
   nhPrivate.getParam("state_topic", STATE_TOPIC);    //状态估计话题
   nhPrivate.getParam("points_topic", POINTS_TOPIC);  //点云数据话题
@@ -811,6 +808,7 @@ int main(int argc, char **argv)
 #endif
   pubStop = nh.advertise<std_msgs::Int8>("/stop", 5);
   pubGoalReached = nh.advertise<std_msgs::Bool>("/goal_reached", 1, true);
+  pubGoalPosReached = nh.advertise<std_msgs::Bool>("/goal_pos_reached", 1, true);
 
   ros::Publisher pubLaserCloud = nh.advertise<sensor_msgs::PointCloud2> ("/local_scans", 2);
 
@@ -865,16 +863,6 @@ int main(int argc, char **argv)
     ros::spinOnce();
     if(reach_goal_flag_g)
     {
-      std_msgs::Int8 stop;
-      stop.data = 2;
-      pubStop.publish(stop);
-      if (pubGoalReached && !goal_reached_pub)
-      {
-        std_msgs::Bool msg;
-        msg.data = true;
-        pubGoalReached.publish(msg);
-        goal_reached_pub = true;
-      }
       status = ros::ok();
       rate.sleep();
       ROS_WARN_THROTTLE(5,"wait for goal ");
@@ -941,76 +929,24 @@ int main(int argc, char **argv)
         relativeGoalDis = sqrt(relativeGoalX * relativeGoalX + relativeGoalY * relativeGoalY);
         joyDir = atan2(relativeGoalY, relativeGoalX) * 180 / PI;
 
-        std::cout << "goalX : " << goalX << std::endl;
-        std::cout << "goalY : " << goalY << std::endl;
-        std::cout << "vehicleX : " << vehicleX_1 << std::endl;
-        std::cout << "vehicleY : " << vehicleY_1 << std::endl;
-        std::cout << "sinVehicleYaw : " << sinVehicleYaw_1 << std::endl;
-        std::cout << "cosVehicleYaw : " << cosVehicleYaw_1 << std::endl;
-
-
-
-
-        ROS_WARN_STREAM("relativeGoalDis: "<< relativeGoalDis);
-        ROS_WARN_STREAM("joydir: "<< joyDir);
-        if(relativeGoalDis<reach_goal_thre_g)
+        // ROS_WARN_STREAM("relativeGoalDis: "<< relativeGoalDis);
+        // ROS_WARN_STREAM("joydir: "<< joyDir);
+        if (relativeGoalDis <= reach_goal_thre_g)
         {
-          if (align_at_goal && hasGoalYaw)
-          {
-            double relativeGoalYaw = wrapAngle(goalYaw - vehicleYaw_1);
-            nav_msgs::Path alignPath;
-            buildAlignSplinePath(
-                relativeGoalX,
-                relativeGoalY,
-                relativeGoalYaw,
-                align_path_points,
-                align_ctrl_scale,
-                align_ctrl_min,
-                align_ctrl_max,
-                align_max_speed,
-                align_use_straight_path,
-                odomTime,
-                alignPath);
-            pubPath.publish(alignPath);
-            align_active = true;
-
-            double yawErrDeg = fabs(relativeGoalYaw) * 180.0 / PI;
-            if (relativeGoalDis < align_pos_thre_g && yawErrDeg < align_yaw_thre_deg)
-            {
-              reach_goal_flag_g = true;
-              ROS_WARN("reach goal (aligned) !!!");
-              if (pubGoalReached)
-              {
-                std_msgs::Bool msg;
-                msg.data = true;
-                pubGoalReached.publish(msg);
-                goal_reached_pub = true;
-              }
-              std_msgs::Int8 stop;
-              stop.data = 2;
-              pubStop.publish(stop);
-            }
-            else
-            {
-              std_msgs::Int8 stop;
-              stop.data = 0;
-              pubStop.publish(stop);
-            }
-            hasLastPath = false;
-            continue;
-          }
-
           reach_goal_flag_g = true;
-          ROS_WARN("reach goal !!!");
-          if (pubGoalReached)
+          if (!pos_reached_pub)
           {
-            std_msgs::Bool msg;
-            msg.data = true;
-            pubGoalReached.publish(msg);
-            goal_reached_pub = true;
+            ROS_INFO("\033[36mstage1 finish\033[0m");
+            if (pubGoalPosReached)
+            {
+              std_msgs::Bool msg;
+              msg.data = true;
+              pubGoalPosReached.publish(msg);
+            }
+            pos_reached_pub = true;
           }
           std_msgs::Int8 stop;
-          stop.data = 2;
+          stop.data = 0;
           pubStop.publish(stop);
           nav_msgs::Path stopPath;
           stopPath.poses.resize(1);
@@ -1287,6 +1223,14 @@ int main(int argc, char **argv)
                   pathSmoothAlpha * path.poses[i].pose.position.z +
                   (1.0 - pathSmoothAlpha) * lastPath.poses[i].pose.position.z;
             }
+          }
+          // Ensure valid orientation for all poses
+          for (size_t i = 0; i < path.poses.size(); i++)
+          {
+            path.poses[i].pose.orientation.x = 0.0;
+            path.poses[i].pose.orientation.y = 0.0;
+            path.poses[i].pose.orientation.z = 0.0;
+            path.poses[i].pose.orientation.w = 1.0;
           }
           pubPath.publish(path);                             // pubPath对象发布路径信息
           lastPath = path;
