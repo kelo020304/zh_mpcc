@@ -77,6 +77,12 @@ cd "$BUILD_DIR"
 
 print_info "===== Installing BLASFEO ====="
 
+# Skip if already installed
+if [ -f "$INSTALL_PREFIX/lib/libblasfeo.a" ] && \
+   { [ -f "$INSTALL_PREFIX/include/blasfeo.h" ] || [ -d "$INSTALL_PREFIX/include/blasfeo" ]; }; then
+    print_info "BLASFEO already installed at $INSTALL_PREFIX, skipping build."
+else
+
 if [ -d "blasfeo" ]; then
     print_warning "BLASFEO directory already exists, removing..."
     rm -rf blasfeo
@@ -124,9 +130,12 @@ else
     sudo make install
     print_info "BLASFEO installed successfully (GENERIC target)!"
 fi
+fi
 
 # Verify BLASFEO installation
-if [ -f "$INSTALL_PREFIX/lib/libblasfeo.a" ] && [ -d "$INSTALL_PREFIX/include/blasfeo" ]; then
+# Some installs place headers in $INSTALL_PREFIX/include, others in $INSTALL_PREFIX/include/blasfeo
+if [ -f "$INSTALL_PREFIX/lib/libblasfeo.a" ] && \
+   { [ -f "$INSTALL_PREFIX/include/blasfeo.h" ] || [ -d "$INSTALL_PREFIX/include/blasfeo" ]; }; then
     print_info "✓ BLASFEO installation verified"
     ls -lh "$INSTALL_PREFIX/lib/libblasfeo.a"
 else
@@ -140,6 +149,12 @@ fi
 
 cd "$BUILD_DIR"
 print_info "===== Installing HPIPM ====="
+
+# Skip if already installed
+if [ -f "$INSTALL_PREFIX/lib/libhpipm.a" ] && \
+   { [ -f "$INSTALL_PREFIX/include/hpipm_d_ocp_qp.h" ] || [ -d "$INSTALL_PREFIX/include/hpipm" ]; }; then
+    print_info "HPIPM already installed at $INSTALL_PREFIX, skipping build."
+else
 
 if [ -d "hpipm" ]; then
     print_warning "HPIPM directory already exists, removing..."
@@ -156,6 +171,7 @@ cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=$INSTALL_PREFIX \
     -DBUILD_SHARED_LIBS=OFF \
+    -DTARGET=$TARGET \
     -DBLASFEO_PATH=$INSTALL_PREFIX
 
 print_info "Compiling HPIPM (this may take a few minutes)..."
@@ -163,9 +179,12 @@ make -j$(nproc)
 
 print_info "Installing HPIPM to $INSTALL_PREFIX..."
 sudo make install
+fi
 
 # Verify HPIPM installation
-if [ -f "$INSTALL_PREFIX/lib/libhpipm.a" ] && [ -d "$INSTALL_PREFIX/include/hpipm" ]; then
+# Some installs place headers in $INSTALL_PREFIX/include, others in $INSTALL_PREFIX/include/hpipm
+if [ -f "$INSTALL_PREFIX/lib/libhpipm.a" ] && \
+   { [ -f "$INSTALL_PREFIX/include/hpipm_d_ocp_qp.h" ] || [ -d "$INSTALL_PREFIX/include/hpipm" ]; }; then
     print_info "✓ HPIPM installation verified"
     ls -lh "$INSTALL_PREFIX/lib/libhpipm.a"
 else
@@ -192,11 +211,11 @@ print_info "===== Installation Summary ====="
 echo ""
 echo "BLASFEO:"
 echo "  Library: $INSTALL_PREFIX/lib/libblasfeo.a"
-echo "  Headers: $INSTALL_PREFIX/include/blasfeo/"
+echo "  Headers: $INSTALL_PREFIX/include/blasfeo/ (or $INSTALL_PREFIX/include/blasfeo.h)"
 echo ""
 echo "HPIPM:"
 echo "  Library: $INSTALL_PREFIX/lib/libhpipm.a"
-echo "  Headers: $INSTALL_PREFIX/include/hpipm/"
+echo "  Headers: $INSTALL_PREFIX/include/hpipm/ (or $INSTALL_PREFIX/include/hpipm_*.h)"
 echo ""
 
 # Create verification test

@@ -21,8 +21,10 @@
 
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
+#include <tf/transform_listener.h>
 
 #include <pcl_conversions/pcl_conversions.h>
+#include <pcl_ros/transforms.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
@@ -39,6 +41,9 @@ const double PI = 3.1415926;
 
 static std::string POINTS_TOPIC; //将点云数据话题写为参数在launch中加载
 static std::string STATE_TOPIC;  //将状态估计信息话题写为参数在launch中加载
+static bool TRANSFORM_POINTS = false;           // 是否将点云变换到指定坐标系
+static std::string POINTS_TARGET_FRAME = "body"; // 目标坐标系
+static tf::TransformListener *tfListener = nullptr;
 
 string pathFolder;               //   	使用matlab生成路径集合的文件路径
 double vehicleLength = 0.6;      //  	车辆的长度，单位m
@@ -381,8 +386,26 @@ void laserCloudHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloud2)
 {
   if (!useTerrainAnalysis)
   {                                             // 检查是否进行地形分析，如果不进行地形分析，则处理点云数据，否则跳过。
-    laserCloud->clear();                        // 清空当前点云
-    pcl::fromROSMsg(*laserCloud2, *laserCloud); // 将ROS的PointCloud2消息格式转换为PCL库可以处理的点云格式
+    laserCloud->clear(); // 清空当前点云
+
+    const sensor_msgs::PointCloud2 *cloudPtr = laserCloud2.get();
+    sensor_msgs::PointCloud2 cloudTransformed;
+    if (TRANSFORM_POINTS && tfListener)
+    {
+      try
+      {
+        pcl_ros::transformPointCloud(POINTS_TARGET_FRAME, *laserCloud2, cloudTransformed, *tfListener);
+        cloudPtr = &cloudTransformed;
+      }
+      catch (const tf::TransformException &ex)
+      {
+        ROS_WARN_THROTTLE(1.0, "localPlanner: failed to transform point cloud to '%s': %s",
+                          POINTS_TARGET_FRAME.c_str(), ex.what());
+        return;
+      }
+    }
+
+    pcl::fromROSMsg(*cloudPtr, *laserCloud); // 将ROS的PointCloud2消息格式转换为PCL库可以处理的点云格式
 
     // 裁剪点云:
     pcl::PointXYZI point;    // 初始化一个临时的pcl::PointXYZI点。
@@ -751,10 +774,19 @@ int main(int argc, char **argv)
   nhPrivate.param("align_max_speed", align_max_speed, align_max_speed);
   nhPrivate.param("align_use_straight_path", align_use_straight_path, align_use_straight_path);
 
-  nhPrivate.getParam("state_topic", STATE_TOPIC);  //状态估计话题
+  nhPrivate.getParam("state_topic", STATE_TOPIC);    //状态估计话题
   nhPrivate.getParam("points_topic", POINTS_TOPIC);  //点云数据话题
-  ROS_INFO_STREAM("odom topic name: "<< STATE_TOPIC);
-  ROS_INFO_STREAM("lidar topic name: "<< POINTS_TOPIC);
+  nhPrivate.param("transform_points", TRANSFORM_POINTS, TRANSFORM_POINTS);
+  nhPrivate.param("points_target_frame", POINTS_TARGET_FRAME, POINTS_TARGET_FRAME);
+
+  if (TRANSFORM_POINTS)
+  {
+    tfListener = new tf::TransformListener();
+    ROS_INFO_STREAM("point cloud transform enabled: " << POINTS_TARGET_FRAME);
+  }
+
+  ROS_INFO_STREAM("odom topic name: " << STATE_TOPIC);
+  ROS_INFO_STREAM("lidar topic name: " << POINTS_TOPIC);
 
   // 设置订阅话题
   ros::Subscriber subOdometry = nh.subscribe<nav_msgs::Odometry>           // 当接收到/state_estimation话题消息更新时启动odometryHandler回调函数 （消息格式：nav_msgs::Odometry消息内容：关于机器人或车辆的位置和方向（姿态）信息）

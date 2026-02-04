@@ -21,7 +21,7 @@
 #include "hpipm_d_ocp_qp_dim.h"
 #include "hpipm_d_ocp_qp.h"
 #include "hpipm_d_ocp_qp_sol.h"
-
+#include "yhs_can_msgs/ctrl_cmd.h"
 using std::vector;
 
 const double PI = 3.141592653589793;
@@ -510,6 +510,8 @@ int main(int argc, char **argv)
   ros::Subscriber subGoalReached = nh.subscribe<std_msgs::Bool>("/goal_reached", 5, goalReachedHandler);
 
   ros::Publisher pubSpeed = nh.advertise<geometry_msgs::Twist>("/cmd_vel", 5);
+  ros::Publisher yhs_ctrl_pub = nh.advertise<yhs_can_msgs::ctrl_cmd>("/ctrl_cmd", 1);
+
   ros::Publisher pubPred = nh.advertise<nav_msgs::Path>("/mpcc_pred_path", 5);
 
   geometry_msgs::Twist cmd_vel;
@@ -643,6 +645,12 @@ int main(int argc, char **argv)
       cmd_vel.linear.y = vyCmd;
       cmd_vel.angular.z = wCmd;
       pubSpeed.publish(cmd_vel);
+
+      yhs_can_msgs::ctrl_cmd yhs_cmd_vel;
+      yhs_cmd_vel.ctrl_cmd_gear = 6;
+      yhs_cmd_vel.ctrl_cmd_x_linear = cmd_vel.linear.x;    // 线速度
+      yhs_cmd_vel.ctrl_cmd_z_angular = cmd_vel.angular.z*57.29d;   // 角速度 (rad/s)
+      yhs_ctrl_pub.publish(yhs_cmd_vel);
 
     }
     rate.sleep();
