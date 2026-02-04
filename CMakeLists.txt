@@ -46,8 +46,23 @@ catkin_package(
 
 ## Specify additional locations of header files
 ## Your package locations should be listed before other locations
-set(HPIPM_ROOT "$ENV{HOME}/.local/hpipm" CACHE PATH "HPIPM install prefix")
-set(BLASFEO_ROOT "$ENV{HOME}/.local/blasfeo" CACHE PATH "BLASFEO install prefix")
+
+# HPIPM/BLASFEO search paths
+# Priority order:
+# 1. /usr/local (recommended, see README.md for installation)
+# 2. Custom paths via HPIPM_ROOT/BLASFEO_ROOT environment variables
+# 3. $HOME/.local (legacy fallback)
+
+set(HPIPM_ROOT "$ENV{HPIPM_ROOT}" CACHE PATH "HPIPM install prefix")
+set(BLASFEO_ROOT "$ENV{BLASFEO_ROOT}" CACHE PATH "BLASFEO install prefix")
+
+# Fallback to ~/.local if environment variables not set
+if(NOT HPIPM_ROOT)
+  set(HPIPM_ROOT "$ENV{HOME}/.local/hpipm")
+endif()
+if(NOT BLASFEO_ROOT)
+  set(BLASFEO_ROOT "$ENV{HOME}/.local/blasfeo")
+endif()
 
 # Support install_static layout: <prefix>/hpipm/{include,lib} and <prefix>/blasfeo/{include,lib}
 if(EXISTS "${HPIPM_ROOT}/hpipm/include")
@@ -66,31 +81,65 @@ if(BLASFEO_ROOT)
   list(APPEND _BLASFEO_HINTS "${BLASFEO_ROOT}")
 endif()
 
+# Find HPIPM headers and library
+# Search order: /usr/local (preferred) -> custom paths -> /usr
 find_path(HPIPM_INCLUDE_DIR hpipm_d_ocp_qp.h
   HINTS ${_HPIPM_HINTS}
-  PATHS ENV CPATH /usr/local/include /usr/include
+  PATHS /usr/local/include /usr/local ENV CPATH /usr/include
   PATH_SUFFIXES hpipm include hpipm/include
-)
-find_path(BLASFEO_INCLUDE_DIR blasfeo_d_aux_ext_dep.h
-  HINTS ${_BLASFEO_HINTS}
-  PATHS ENV CPATH /usr/local/include /usr/include
-  PATH_SUFFIXES blasfeo include blasfeo/include
+  DOC "HPIPM include directory"
 )
 find_library(HPIPM_LIB hpipm
   HINTS ${_HPIPM_HINTS}
-  PATHS /usr/local/lib /usr/lib
+  PATHS /usr/local/lib /usr/local /usr/lib
   PATH_SUFFIXES lib hpipm/lib
+  DOC "HPIPM library"
+)
+
+# Find BLASFEO headers and library
+# Search order: /usr/local (preferred) -> custom paths -> /usr
+find_path(BLASFEO_INCLUDE_DIR blasfeo_d_aux_ext_dep.h
+  HINTS ${_BLASFEO_HINTS}
+  PATHS /usr/local/include /usr/local ENV CPATH /usr/include
+  PATH_SUFFIXES blasfeo include blasfeo/include
+  DOC "BLASFEO include directory"
 )
 find_library(BLASFEO_LIB blasfeo
   HINTS ${_BLASFEO_HINTS}
-  PATHS /usr/local/lib /usr/lib
+  PATHS /usr/local/lib /usr/local /usr/lib
   PATH_SUFFIXES lib blasfeo/lib
+  DOC "BLASFEO library"
 )
 
-if(NOT HPIPM_INCLUDE_DIR OR NOT BLASFEO_INCLUDE_DIR OR NOT HPIPM_LIB OR NOT BLASFEO_LIB)
+# Report findings
+if(HPIPM_INCLUDE_DIR AND HPIPM_LIB)
+  message(STATUS "Found HPIPM: ${HPIPM_LIB}")
+  message(STATUS "  Include: ${HPIPM_INCLUDE_DIR}")
+else()
   message(FATAL_ERROR
-    "HPIPM/BLASFEO not found. Set HPIPM_ROOT and BLASFEO_ROOT to your install prefix, "
-    "or ensure headers/libs are on CPATH/LIBRARY_PATH.")
+    "HPIPM not found!\n"
+    "Please install HPIPM following the instructions in README.md:\n"
+    "  - Recommended: Install to /usr/local (see 'Dependencies Installation' section)\n"
+    "  - Alternative: Set HPIPM_ROOT environment variable to custom install path\n"
+    "Current search paths:\n"
+    "  HPIPM_ROOT: ${HPIPM_ROOT}\n"
+    "  System paths: /usr/local, /usr"
+  )
+endif()
+
+if(BLASFEO_INCLUDE_DIR AND BLASFEO_LIB)
+  message(STATUS "Found BLASFEO: ${BLASFEO_LIB}")
+  message(STATUS "  Include: ${BLASFEO_INCLUDE_DIR}")
+else()
+  message(FATAL_ERROR
+    "BLASFEO not found!\n"
+    "Please install BLASFEO following the instructions in README.md:\n"
+    "  - Recommended: Install to /usr/local (see 'Dependencies Installation' section)\n"
+    "  - Alternative: Set BLASFEO_ROOT environment variable to custom install path\n"
+    "Current search paths:\n"
+    "  BLASFEO_ROOT: ${BLASFEO_ROOT}\n"
+    "  System paths: /usr/local, /usr"
+  )
 endif()
 
 include_directories(

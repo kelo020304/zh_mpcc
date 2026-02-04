@@ -260,13 +260,293 @@ Local Planner 是一个为全向移动机器人设计的局部路径规划与跟
   - HPIPM (用于 MPCC)
   - BLASFEO (HPIPM 依赖)
 
+### 依赖库安装
+
+#### 安装基础依赖
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential \
+  cmake \
+  git \
+  libeigen3-dev \
+  libpcl-dev \
+  ros-noetic-pcl-ros \
+  ros-noetic-pcl-conversions
+```
+
+#### 安装 HPIPM 和 BLASFEO
+
+HPIPM 是 MPCC 控制器使用的高性能 QP 求解器。以下步骤支持 **x86_64** 和 **ARM (aarch64)** 架构。
+
+##### 方式 1：自动化安装脚本（推荐）
+
+使用提供的安装脚本自动完成所有步骤：
+
+```bash
+cd /path/to/local_planner
+bash scripts/install_hpipm.sh
+```
+
+**脚本功能**：
+- ✅ 自动检测 CPU 架构（x86_64 / ARM）
+- ✅ 选择最优 BLASFEO 编译目标
+- ✅ 克隆并编译 BLASFEO 和 HPIPM
+- ✅ 安装到 /usr/local
+- ✅ 运行验证测试
+- ✅ 自动清理临时文件
+
+**预期输出**：
+
+```
+[INFO] Detected architecture: x86_64
+[INFO] Using BLASFEO target: X64_AUTOMATIC
+[INFO] Installation prefix: /usr/local
+[INFO] ===== Installing BLASFEO =====
+...
+[INFO] ✓ BLASFEO installation verified
+[INFO] ===== Installing HPIPM =====
+...
+[INFO] ✓ HPIPM installation verified
+✓ HPIPM and BLASFEO headers found!
+✓ Installation successful!
+[INFO] ===== All installations completed successfully! =====
+```
+
+如果自动安装失败或需要自定义配置，请使用下面的手动安装步骤。
+
+##### 方式 2：手动安装
+
+###### 1. 安装 BLASFEO（HPIPM 的依赖）
+
+```bash
+# 创建临时编译目录
+mkdir -p ~/temp_build && cd ~/temp_build
+
+# 克隆 BLASFEO 仓库
+git clone https://github.com/giaf/blasfeo.git
+cd blasfeo
+
+# 检测 CPU 架构并设置目标
+ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ]; then
+  TARGET=X64_AUTOMATIC
+elif [ "$ARCH" = "aarch64" ]; then
+  TARGET=ARMV8A_ARM_CORTEX_A57  # ARM Cortex-A57/A72 通用目标
+else
+  echo "Unsupported architecture: $ARCH"
+  exit 1
+fi
+
+echo "Detected architecture: $ARCH, using TARGET=$TARGET"
+
+# 配置和编译（安装到 /usr/local）
+mkdir -p build && cd build
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DTARGET=$TARGET \
+  -DCMAKE_INSTALL_PREFIX=/usr/local \
+  -DBUILD_SHARED_LIBS=OFF
+
+make -j$(nproc)
+sudo make install
+
+# 验证安装
+ls /usr/local/include/blasfeo/
+ls /usr/local/lib/libblasfeo.a
+```
+
+**常见 ARM 目标选项**：
+- `ARMV8A_ARM_CORTEX_A57` - Cortex-A57/A72（树莓派 4、Jetson Nano/TX2）
+- `ARMV8A_ARM_CORTEX_A53` - Cortex-A53（树莓派 3）
+- `ARMV8A_ARM_CORTEX_A73` - Cortex-A73（部分手机处理器）
+
+如果不确定目标，使用 `GENERIC` 作为通用目标（性能较低但兼容性好）：
+```bash
+TARGET=GENERIC
+```
+
+###### 2. 安装 HPIPM
+
+```bash
+# 返回临时编译目录
+cd ~/temp_build
+
+# 克隆 HPIPM 仓库
+git clone https://github.com/giaf/hpipm.git
+cd hpipm
+
+# 配置和编译（安装到 /usr/local）
+mkdir -p build && cd build
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/usr/local \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DBLASFEO_PATH=/usr/local
+
+make -j$(nproc)
+sudo make install
+
+# 验证安装
+ls /usr/local/include/hpipm/
+ls /usr/local/lib/libhpipm.a
+```
+
+###### 3. 更新库路径（可选）
+
+如果编译时提示找不到库，运行：
+
+```bash
+sudo ldconfig
+```
+
+###### 4. 清理临时文件
+
+```bash
+cd ~
+rm -rf ~/temp_build
+```
+
+#### 验证 HPIPM 安装
+
+##### 快速检查（推荐）
+
+使用提供的检查脚本：
+
+```bash
+cd /path/to/local_planner
+bash scripts/check_hpipm.sh
+```
+
+**预期输出**（成功）：
+
+```
+======================================
+HPIPM/BLASFEO Installation Checker
+======================================
+
+Checking installation in: /usr/local
+
+===== BLASFEO =====
+✓ Found: /usr/local/lib/libblasfeo.a
+✓ Found: /usr/local/include/blasfeo
+✓ Found: /usr/local/include/blasfeo/blasfeo_d_aux_ext_dep.h
+
+===== HPIPM =====
+✓ Found: /usr/local/lib/libhpipm.a
+✓ Found: /usr/local/include/hpipm
+✓ Found: /usr/local/include/hpipm/hpipm_d_ocp_qp.h
+
+===== Compilation Test =====
+✓ Compilation test passed
+
+======================================
+✓ All checks passed!
+HPIPM and BLASFEO are correctly installed.
+```
+
+##### 手动验证
+
+创建测试文件 `test_hpipm.cpp`：
+
+```cpp
+#include <hpipm_d_ocp_qp.h>
+#include <blasfeo_d_aux_ext_dep.h>
+#include <iostream>
+
+int main() {
+    std::cout << "HPIPM and BLASFEO headers found!" << std::endl;
+    return 0;
+}
+```
+
+编译测试：
+
+```bash
+g++ test_hpipm.cpp -o test_hpipm \
+  -I/usr/local/include \
+  -L/usr/local/lib \
+  -lhpipm -lblasfeo -lm
+
+./test_hpipm
+```
+
+如果输出 `HPIPM and BLASFEO headers found!`，说明安装成功。
+
+#### 故障排除
+
+**问题 1：找不到 blasfeo.h 或 hpipm_d_ocp_qp.h**
+
+```bash
+# 检查头文件是否存在
+find /usr/local -name "blasfeo*.h"
+find /usr/local -name "hpipm*.h"
+
+# 如果在 /usr/local/include/blasfeo/blasfeo.h，需要添加包含路径
+export CPATH=/usr/local/include:$CPATH
+```
+
+**问题 2：CMake 找不到 HPIPM/BLASFEO**
+
+确保 CMakeLists.txt 中包含 `/usr/local` 搜索路径（本项目已配置）。
+
+**问题 3：ARM 架构编译失败**
+
+尝试使用通用目标：
+```bash
+cmake .. -DTARGET=GENERIC -DCMAKE_INSTALL_PREFIX=/usr/local
+```
+
 ### 编译
+
+#### 标准编译（HPIPM/BLASFEO 在 /usr/local）
 
 ```bash
 cd /path/to/your/catkin_ws
 catkin_make
-# 或
+# 或使用 catkin_tools
 catkin build local_planner
+```
+
+#### 自定义 HPIPM/BLASFEO 路径
+
+如果你将 HPIPM/BLASFEO 安装到了非标准位置，可以通过环境变量指定：
+
+```bash
+export HPIPM_ROOT=/path/to/hpipm
+export BLASFEO_ROOT=/path/to/blasfeo
+
+cd /path/to/your/catkin_ws
+catkin_make
+```
+
+或者在编译时直接指定：
+
+```bash
+cd /path/to/your/catkin_ws
+catkin_make -DHPIPM_ROOT=/path/to/hpipm -DBLASFEO_ROOT=/path/to/blasfeo
+```
+
+**CMake 搜索优先级**：
+1. `/usr/local`（推荐，按照上述安装步骤）
+2. 环境变量 `HPIPM_ROOT` 和 `BLASFEO_ROOT` 指定的路径
+3. `$HOME/.local/hpipm` 和 `$HOME/.local/blasfeo`（遗留兼容）
+
+#### 验证编译
+
+编译成功后，检查可执行文件：
+
+```bash
+ls devel/lib/local_planner/
+# 应该看到: localPlanner  pathFollower  mpccfollower
+```
+
+测试 mpccfollower 是否正确链接 HPIPM：
+
+```bash
+ldd devel/lib/local_planner/mpccfollower | grep -E "hpipm|blasfeo"
+# 应该看到 libhpipm.a 和 libblasfeo.a
 ```
 
 ### 运行
