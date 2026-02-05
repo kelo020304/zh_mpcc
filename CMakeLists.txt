@@ -19,7 +19,7 @@ find_package(catkin REQUIRED COMPONENTS
   pcl_ros
   pcl_conversions
   tf
-#   // yhs_can_msgs
+  yhs_can_msgs
 )
 
 find_package(PCL REQUIRED)
@@ -39,7 +39,6 @@ catkin_package(
   pcl_ros
   pcl_conversions
   tf
-  yhs_can_msgs
 )
 
 ###########
