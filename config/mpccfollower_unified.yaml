@@ -10,7 +10,7 @@ sensorOffsetX: 0.0
 sensorOffsetY: 0.0
 
 # ------------ MPC 求解器配置 ------------
-mpc_hz: 30.0
+mpc_hz: 50.0
 mpc_horizon: 30
 
 # ------------ 速度与控制约束 ------------
