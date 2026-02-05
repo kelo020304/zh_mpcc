@@ -652,6 +652,20 @@ static bool solveMpccQp(
     ubx[0][i] = x0[i];
   }
 
+  // **NEW: Add s bounds for all stages to prevent s from going out of path range**
+  double sMax = pathS.empty() ? 10.0 : pathS.back();
+  double sMin = 0.0;
+  for (int k = 1; k <= N; k++)
+  {
+    nbx[k] = 1;  // Only constrain s (index 3)
+    idxbx[k].resize(1);
+    lbx[k].resize(1);
+    ubx[k].resize(1);
+    idxbx[k][0] = 3;  // s is the 4th state (index 3)
+    lbx[k][0] = sMin;
+    ubx[k][0] = sMax;
+  }
+
   // **MODIFIED: Allow full bidirectional vs range**
   for (int k = 0; k < N; k++)
   {
