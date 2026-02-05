@@ -465,7 +465,13 @@ static void samplePathByS(double s, double &x, double &y, double &yaw, int &dir)
   const double t = (s - s0) / std::max(1e-6, s1 - s0);
   x = pathX[idx] * (1.0 - t) + pathX[idx + 1] * t;
   y = pathY[idx] * (1.0 - t) + pathY[idx + 1] * t;
-  yaw = pathYaw[idx] * (1.0 - t) + pathYaw[idx + 1] * t;
+
+  // **FIX: Proper angle interpolation to handle ±π wraparound**
+  double yaw0 = pathYaw[idx];
+  double yaw1 = pathYaw[idx + 1];
+  double dyaw = wrapAngle(yaw1 - yaw0);  // Shortest angular difference
+  yaw = wrapAngle(yaw0 + t * dyaw);
+
   dir = pathDir[idx];  // Use discrete direction of nearest segment
 }
 
@@ -986,9 +992,11 @@ int main(int argc, char **argv)
         }
         else
         {
-          // find nearest s
+          // **IMPROVED: Find nearest point on path with precise projection**
           int bestIdx = 0;
           double bestDis = 1e9;
+          double s0 = 0.0;
+
           for (int i = 0; i < pathSize; i++)
           {
             double dx = pathX[i] - vehicleXRel;
@@ -1000,7 +1008,44 @@ int main(int argc, char **argv)
               bestIdx = i;
             }
           }
-          double s0 = pathS.empty() ? 0.0 : pathS[bestIdx];
+
+          // Refine s0 by projecting onto the segment near bestIdx
+          if (pathSize >= 2 && !pathS.empty())
+          {
+            // Try projecting onto segment [bestIdx-1, bestIdx] and [bestIdx, bestIdx+1]
+            double best_s = pathS[bestIdx];
+            double best_proj_dist = bestDis;
+
+            for (int seg = std::max(0, bestIdx - 1); seg < std::min(pathSize - 1, bestIdx + 1); seg++)
+            {
+              double ax = pathX[seg], ay = pathY[seg];
+              double bx = pathX[seg + 1], by = pathY[seg + 1];
+              double abx = bx - ax, aby = by - ay;
+              double apx = vehicleXRel - ax, apy = vehicleYRel - ay;
+              double ab_len2 = abx * abx + aby * aby;
+
+              if (ab_len2 > 1e-9)
+              {
+                double t = (apx * abx + apy * aby) / ab_len2;
+                t = std::max(0.0, std::min(1.0, t));  // Clamp to segment
+                double proj_x = ax + t * abx;
+                double proj_y = ay + t * aby;
+                double proj_dist = (vehicleXRel - proj_x) * (vehicleXRel - proj_x) +
+                                   (vehicleYRel - proj_y) * (vehicleYRel - proj_y);
+
+                if (proj_dist < best_proj_dist)
+                {
+                  best_proj_dist = proj_dist;
+                  best_s = pathS[seg] + t * (pathS[seg + 1] - pathS[seg]);
+                }
+              }
+            }
+            s0 = best_s;
+          }
+          else
+          {
+            s0 = pathS.empty() ? 0.0 : pathS[bestIdx];
+          }
 
           // **MODIFIED: Remove manual gear selection, let optimizer decide**
           int N = std::max(1, mpcHorizon);
