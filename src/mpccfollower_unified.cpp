@@ -416,10 +416,10 @@ void pathHandler(const nav_msgs::Path::ConstPtr &pathIn)
            pathSize, pathLength, forwardCount, reverseCount, rotateCount);
 
   // Show first few points with detailed debug
-  for (int i = 0; i < std::min(1, pathSize); i++)
+  for (int i = 0; i < std::min(3, pathSize); i++)
   {
     const char* dirStr = (pathDir[i] == 1) ? "fwd" : (pathDir[i] == -1) ? "rev" : "rot";
-    ROS_INFO("  dir=%s yaw=%.2f pos=(%.2f,%.2f)", i, dirStr, pathYaw[i], pathX[i], pathY[i]);
+    ROS_INFO("  [%d] dir=%s yaw=%.2f pos=(%.2f,%.2f)", i, dirStr, pathYaw[i], pathX[i], pathY[i]);
   }
 
   // Additional debug: show raw quaternion of first point
@@ -666,12 +666,42 @@ static bool solveMpccQp(
     ubx[k][0] = sMax;
   }
 
-  // **MODIFIED: Allow full bidirectional vs range**
+  // **MODIFIED: Hard constraint on vs direction based on pathDir**
+  // This ensures MPCC strictly follows local planner's forward/reverse intent
   for (int k = 0; k < N; k++)
   {
     idxbu[k] = {0, 1, 2, 3};
-    lbu[k] = {-vxMax, -vyMax, -wMax, vsMin};  // vsMin can be negative
-    ubu[k] = {vxMax, vyMax, wMax, vsMax};
+
+    // Determine vs bounds based on path direction at this horizon step
+    double vsLo = vsMin;
+    double vsHi = vsMax;
+
+    if (usePathDirectionHint)
+    {
+      // Sample path direction at this step
+      double x_ref, y_ref, yaw_ref;
+      int dir_ref;
+      samplePathByS(s_guess[k], x_ref, y_ref, yaw_ref, dir_ref);
+
+      if (dir_ref == 1)  // Forward: vs >= 0
+      {
+        vsLo = 0.0;
+        vsHi = vsMax;
+      }
+      else if (dir_ref == -1)  // Reverse: vs <= 0
+      {
+        vsLo = vsMin;
+        vsHi = 0.0;
+      }
+      else  // In-place rotation: allow small vs
+      {
+        vsLo = -0.05;
+        vsHi = 0.05;
+      }
+    }
+
+    lbu[k] = {-vxMax, -vyMax, -wMax, vsLo};
+    ubu[k] = {vxMax, vyMax, wMax, vsHi};
   }
 
   // set hpipm pointers
