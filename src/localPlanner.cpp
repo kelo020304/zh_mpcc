@@ -1274,8 +1274,8 @@ int main(int argc, char **argv)
               tangent_yaw = goal_dir;  // 只有一个点时用目标方向
             }
 
-            // 如果是倒车，姿态朝向切线反方向（即机器人背对着运动方向）
-            double pose_yaw = is_reverse ? tangent_yaw + M_PI : tangent_yaw;
+            // 姿态始终沿切线方向
+            double pose_yaw = tangent_yaw;
             while (pose_yaw > M_PI) pose_yaw -= 2.0 * M_PI;
             while (pose_yaw < -M_PI) pose_yaw += 2.0 * M_PI;
 

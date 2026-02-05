@@ -74,6 +74,7 @@ double alignPosSpeed = 0.05;
 double alignYawThreDeg = 10.0;
 double alignYawSpeed = 0.3;
 double alignTimeoutS = 8.0;
+bool alignToPathEndYaw = false;
 
 // **MODIFIED: Simplified gear control - let optimizer decide**
 bool usePathDirectionHint = true;  // Use path direction as soft guidance
@@ -134,6 +135,7 @@ static ros::Publisher pubGoalReached;
 static double align_start_time = 0.0;
 static bool align_mode_active = false;
 static bool align_log_pending = false;
+static bool align_final_logged = false;
 
 inline double clampVal(double v, double lo, double hi)
 {
@@ -266,9 +268,9 @@ static void computePathYawAndDirection()
     }
     else if (accumDist > 1e-4)
     {
-      // Sufficient displacement - use motion direction as reference
+      // Sufficient displacement - determine forward/reverse by geometry (body frame)
       double motionYaw = atan2(totalDy, totalDx);
-      pathDir[i] = 1;  // Default forward (no orientation info in this mode)
+      pathDir[i] = (fabs(motionYaw) > PI / 2) ? -1 : 1;
     }
     else
     {
@@ -283,6 +285,8 @@ static void computePathYawAndDirection()
     pathYaw[i] = pathYaw[i - 1] + dyaw;
   }
 }
+
+// Decide forward/reverse by path geometry in body frame (independent of path orientation)
 
 void pathHandler(const nav_msgs::Path::ConstPtr &pathIn)
 {
@@ -366,15 +370,11 @@ void pathHandler(const nav_msgs::Path::ConstPtr &pathIn)
       }
       else if (accumDist > 1e-4)
       {
-        // Sufficient displacement - determine direction
+        // Sufficient displacement - determine forward/reverse by geometry (body frame)
         double motionYaw = atan2(totalDy, totalDx);
-        double pathYawLocal = pathYaw[i];
-        double headingDiff = wrapAngle(pathYawLocal - motionYaw);
-
-        // If path yaw points backward relative to motion, this is a reverse segment
-        if (fabs(headingDiff) > PI / 2)
+        if (fabs(motionYaw) > PI / 2)
         {
-          pathDir[i] = -1;  // Reverse
+          pathDir[i] = -1;  // Reverse (path points behind)
         }
         else
         {
@@ -556,7 +556,13 @@ static bool solveMpccQp(
 
     const double wC = (k == N) ? qC_f : qC;
     const double wL = (k == N) ? qL_f : qL;
-    const double wYaw = (k == N) ? qYaw_f : qYaw;
+    double wYaw = (k == N) ? qYaw_f : qYaw;
+    // For reverse segments, track the opposite yaw to allow smooth reverse turns
+    double yaw_track = yaw_ref;
+    if (dir_ref < 0)
+    {
+      yaw_track = wrapAngle(yaw_ref + PI);
+    }
 
     // **MODIFIED: For in-place rotation segments, heavily penalize lag error**
     const double wC_eff = (dir_ref == 0) ? wC * 10.0 : wC;  // Increase contour weight for rotation
@@ -577,7 +583,7 @@ static bool solveMpccQp(
 
     // yaw tracking
     Q[k][2 + 2 * NX] += 2.0 * wYaw;
-    q[k][2] += 2.0 * wYaw * (-yaw_ref);
+    q[k][2] += 2.0 * wYaw * (-yaw_track);
 
     if (k < N)
     {
@@ -863,6 +869,7 @@ int main(int argc, char **argv)
   nhPrivate.param("align_yaw_thre_deg", alignYawThreDeg, alignYawThreDeg);
   nhPrivate.param("align_yaw_speed", alignYawSpeed, alignYawSpeed);
   nhPrivate.param("align_timeout_s", alignTimeoutS, alignTimeoutS);
+  nhPrivate.param("align_to_path_end_yaw", alignToPathEndYaw, alignToPathEndYaw);
   nhPrivate.param("use_path_direction_hint", usePathDirectionHint, usePathDirectionHint);
   nhPrivate.param("in_place_rot_threshold", inPlaceRotThreshold, inPlaceRotThreshold);
 
@@ -898,7 +905,24 @@ int main(int argc, char **argv)
       double wCmd = 0.0;
       bool alignActive = false;
 
-      if (hasGoalPos && hasGoalYaw)
+      bool haveTargetYaw = false;
+      double targetYaw = 0.0;
+      if (alignToPathEndYaw && pathInit && !pathYaw.empty())
+      {
+        double candidate = wrapAngle(vehicleYawRec + pathYaw.back());
+        if (std::isfinite(candidate))
+        {
+          targetYaw = candidate;
+          haveTargetYaw = true;
+        }
+      }
+      if (!haveTargetYaw && hasGoalYaw && std::isfinite(goalYaw))
+      {
+        targetYaw = goalYaw;
+        haveTargetYaw = true;
+      }
+
+      if (hasGoalPos && haveTargetYaw)
       {
         double dxg = goalX - vehicleX;
         double dyg = goalY - vehicleY;
@@ -911,10 +935,16 @@ int main(int argc, char **argv)
             align_mode_active = true;
             align_start_time = odomTime;
             align_log_pending = true;
+            align_final_logged = false;
           }
-          const double yawErr = wrapAngle(goalYaw - vehicleYaw);
+          double yawErr = wrapAngle(targetYaw - vehicleYaw);
+          if (!std::isfinite(yawErr))
+          {
+            ROS_WARN_THROTTLE(1.0, "align yawErr is NaN, skip yaw align");
+            yawErr = 0.0;
+          }
           const double yawErrDeg = fabs(yawErr) * 180.0 / PI;
-          const double goalYawDeg = goalYaw * 180.0 / PI;
+          const double goalYawDeg = targetYaw * 180.0 / PI;
           const double vehicleYawDeg = vehicleYaw * 180.0 / PI;
           auto log_align_status = [&](const char *tag) {
             ROS_INFO("\033[36malign status%s: goalDis=%.3f yawErrDeg=%.1f vx=%.3f vy=%.3f w=%.3f "
@@ -929,7 +959,11 @@ int main(int argc, char **argv)
             vxCmd = 0.0;
             vyCmd = 0.0;
             wCmd = 0.0;
-            log_align_status(" (final)");
+            if (!align_final_logged)
+            {
+              log_align_status(" (final)");
+              align_final_logged = true;
+            }
             if (!goal_reached_pub)
             {
               std_msgs::Bool msg;
@@ -991,7 +1025,11 @@ int main(int argc, char **argv)
               vxCmd = 0.0;
               vyCmd = 0.0;
               wCmd = 0.0;
-              log_align_status(" (final)");
+              if (!align_final_logged)
+              {
+                log_align_status(" (final)");
+                align_final_logged = true;
+              }
               if (!goal_reached_pub)
               {
                 std_msgs::Bool msg;
@@ -1024,6 +1062,7 @@ int main(int argc, char **argv)
         align_mode_active = false;
         align_start_time = 0.0;
         align_log_pending = false;
+        align_final_logged = false;
       }
 
       if (!alignActive && pathInit && !pathX.empty())
@@ -1106,7 +1145,7 @@ int main(int argc, char **argv)
           vector<double> s_guess(N + 1, s0);
 
           // Simple initialization: assume constant progress
-          double step_s = 0.1;  // Small default step
+          double step_s = std::max(0.01, std::min(0.05, maxSpeed * mpcDt));  // Scale with speed/time
           for (int k = 1; k <= N; k++)
             s_guess[k] = s_guess[k - 1] + step_s;
 
