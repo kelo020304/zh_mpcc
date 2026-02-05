@@ -1002,32 +1002,6 @@ int main(int argc, char **argv)
           }
           double s0 = pathS.empty() ? 0.0 : pathS[bestIdx];
 
-          // **NEW: Determine initial direction based on vehicle orientation vs path**
-          // Check if vehicle is facing the path or backing to it
-          double initialDirHint = 1.0;  // Default: forward
-          if (bestIdx + 1 < pathSize)
-          {
-            // Get path direction at current position
-            double dx = pathX[bestIdx + 1] - pathX[bestIdx];
-            double dy = pathY[bestIdx + 1] - pathY[bestIdx];
-            double pathHeading = atan2(dy, dx);
-
-            // Calculate angle difference: vehicle yaw vs path heading
-            double headingDiff = wrapAngle(vehicleYawRel - pathHeading);
-
-            // If vehicle is backing to the path (> 90°), suggest reverse
-            if (fabs(headingDiff) > PI / 2.0)
-            {
-              initialDirHint = -1.0;  // Suggest reverse
-              ROS_INFO_THROTTLE(2.0, "\033[33mVehicle backing to path, suggesting reverse (headingDiff=%.1f°)\033[0m",
-                              headingDiff * 180.0 / PI);
-            }
-            else
-            {
-              initialDirHint = 1.0;   // Suggest forward
-            }
-          }
-
           // **MODIFIED: Remove manual gear selection, let optimizer decide**
           int N = std::max(1, mpcHorizon);
           vector<double> s_guess(N + 1, s0);
@@ -1050,30 +1024,32 @@ int main(int argc, char **argv)
           }
           pathJustUpdated = false;
 
-          // Use initial direction hint instead of lastVsSign for better initial guess
-          double vsSignToUse = initialDirHint;
-
           vector<double> x0 = {vehicleXRel, vehicleYRel, vehicleYawRel, s0};
           QPSolution sol;
-          if (solveMpccQp(x0, s_guess, N, mpcDt, vsSignToUse, sol))
+          if (solveMpccQp(x0, s_guess, N, mpcDt, lastVsSign, sol))
           {
             double speedScale = std::max(0.0f, std::min(1.0f, joySpeed));
             if (autonomyMode && joySpeedRaw == 0)
             {
               speedScale = std::max(0.0, std::min(1.0, autonomySpeed / std::max(1.0, maxSpeed)));
             }
-            // CRITICAL: MPCC outputs world-frame velocities, must transform to body frame
-            // World frame: x-east, y-north; Body frame: x-forward, y-left
-            double vx_world = sol.uk[0] * speedScale;
-            double vy_world = sol.uk[1] * speedScale;
+            // MPCC outputs velocities in PATH frame (relative to path start)
+            // Need to transform: path frame -> world frame -> body frame
 
-            // Transform: world frame → body frame
-            // vx_body =  cos(yaw)*vx_world + sin(yaw)*vy_world
-            // vy_body = -sin(yaw)*vx_world + cos(yaw)*vy_world
-            double c = cos(vehicleYaw);
-            double s = sin(vehicleYaw);
-            vxCmd = c * vx_world + s * vy_world;   // body forward
-            vyCmd = -s * vx_world + c * vy_world;  // body lateral
+            // Step 1: Path frame -> World frame
+            double vx_path = sol.uk[0] * speedScale;
+            double vy_path = sol.uk[1] * speedScale;
+            double c_rec = cos(vehicleYawRec);
+            double s_rec = sin(vehicleYawRec);
+            double vx_world = c_rec * vx_path - s_rec * vy_path;
+            double vy_world = s_rec * vx_path + c_rec * vy_path;
+
+            // Step 2: World frame -> Body frame
+            double c_veh = cos(vehicleYaw);
+            double s_veh = sin(vehicleYaw);
+            vxCmd = c_veh * vx_world + s_veh * vy_world;   // body forward
+            vyCmd = -s_veh * vx_world + c_veh * vy_world;  // body lateral
+
             wCmd = sol.uk[2] * speedScale;
             double vs = sol.uk[3];
 
@@ -1093,8 +1069,8 @@ int main(int argc, char **argv)
               lastVsSign = (vs > 0) ? 1.0 : -1.0;
             }
 
-            ROS_INFO_THROTTLE(1.0, "\033[36mmpcc: body[vx=%.2f vy=%.2f w=%.2f] world[vx=%.2f vy=%.2f] vs=%.2f dir=%s\033[0m",
-                              vxCmd, vyCmd, wCmd, vx_world, vy_world, vs, (vs >= 0) ? "fwd" : "rev");
+            ROS_INFO_THROTTLE(1.0, "\033[36mmpcc cmd: vx=%.3f vy=%.3f w=%.3f vs=%.3f dir=%s\033[0m",
+                              vxCmd, vyCmd, wCmd, vs, (vs >= 0) ? "forward" : "reverse");
             last_s_guess.resize(N + 1);
             for (int k = 0; k <= N; k++)
               last_s_guess[k] = sol.xk[k * 4 + 3];
