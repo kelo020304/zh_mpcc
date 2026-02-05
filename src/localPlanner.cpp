@@ -327,14 +327,24 @@ static void buildAlignSplinePath(
       const double h01 = -2.0*t*t*t + 3.0*t*t;             // p1 系数
       const double h11 = t*t*t - t*t;                      // m1 系数
 
-      // Hermite 插值
+      // Hermite 插值 - 位置
       const double x = h00*p0x + h10*m0x + h01*p1x + h11*m1x;
       const double y = h00*p0y + h10*m0y + h01*p1y + h11*m1y;
 
+      // Hermite 插值 - 切线（导数）用于计算姿态
+      const double h00_d = 6.0*t*t - 6.0*t;               // h00 的导数
+      const double h10_d = 3.0*t*t - 4.0*t + 1.0;         // h10 的导数
+      const double h01_d = -6.0*t*t + 6.0*t;              // h01 的导数
+      const double h11_d = 3.0*t*t - 2.0*t;               // h11 的导数
+
+      // **使用目标姿态作为路径姿态**
+      // MPCC会通过比较姿态和运动方向自动判断前进/倒车：
+      // - 如果目标在前方：运动方向≈目标姿态 → 前进
+      // - 如果目标在后方：运动方向≈目标姿态+180° → 倒车
       out.poses[i].pose.position.x = x;
       out.poses[i].pose.position.y = y;
       out.poses[i].pose.position.z = 0.0;
-      out.poses[i].pose.orientation.w = 1.0;
+      out.poses[i].pose.orientation = tf::createQuaternionMsgFromYaw(goal_yaw_b);
     }
   }
 }
