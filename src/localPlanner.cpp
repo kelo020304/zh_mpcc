@@ -1240,8 +1240,10 @@ int main(int argc, char **argv)
           while (goal_yaw_body > M_PI) goal_yaw_body -= 2.0 * M_PI;
           while (goal_yaw_body < -M_PI) goal_yaw_body += 2.0 * M_PI;
 
-          // 2. 使用joyDir作为目标方向（已计算好，度数制转弧度）
-          double goal_dir = joyDir * M_PI / 180.0;
+          // 2. 计算原始目标方向（不使用可能被裁剪的joyDir）
+          float relGoalX = ((goalX - vehicleX_1) * cosVehicleYaw_1 + (goalY - vehicleY_1) * sinVehicleYaw_1);
+          float relGoalY = (-(goalX - vehicleX_1) * sinVehicleYaw_1 + (goalY - vehicleY_1) * cosVehicleYaw_1);
+          double goal_dir = atan2(relGoalY, relGoalX);  // 原始目标方向，未裁剪
 
           // 3. 判断是前进还是倒车：比较目标姿态和目标方向
           double yaw_dir_diff = goal_yaw_body - goal_dir;
