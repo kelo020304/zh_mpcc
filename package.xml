@@ -26,5 +26,5 @@
   <run_depend>pcl_ros</run_depend>
   <run_depend>pcl_conversions</run_depend>
   <run_depend>tf</run_depend>
-  <!-- <run_depend>yhs_can_msgs</run_depend> -->
+  <run_depend>yhs_can_msgs</run_depend>
 </package>

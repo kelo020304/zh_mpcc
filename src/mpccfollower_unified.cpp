@@ -56,6 +56,13 @@ double qVsDir = 5.0;      // Weight for direction guidance (encourage vs to matc
 double qGearSwitch = 10.0; // Penalty for gear switching (discourage frequent direction changes)
 double rInPlaceRot = 0.1;  // Reduced control penalty for in-place rotation segments
 
+// **NEW: Acceleration constraint (control smoothing)**
+bool enableMpcDuPenalty = true;  // Enable soft constraint on control changes
+double rDuVx = 10.0;  // Penalty weight for vx change
+double rDuVy = 10.0;  // Penalty weight for vy change
+double rDuW = 5.0;    // Penalty weight for w change
+double rDuVs = 5.0;   // Penalty weight for vs change
+
 double stopDisThre = 0.2;
 double maxSpeed = 1.0;
 bool autonomyMode = false;
@@ -118,6 +125,10 @@ static geometry_msgs::Twist targetCmd;
 static geometry_msgs::Twist lastCmd;
 static double lastCmdTime = 0.0;
 static double lastVsSign = 1.0;  // **NEW: Track previous direction for gear switch penalty
+
+// **NEW: Track previous control for acceleration penalty**
+static std::vector<double> lastU = {0.0, 0.0, 0.0, 0.0};  // [vx, vy, w, vs]
+static bool hasLastU = false;
 
 static ros::Publisher pubGoalReached;
 static double align_start_time = 0.0;
@@ -574,6 +585,22 @@ static bool solveMpccQp(
       R[k][2 + 2 * NU] += 2.0 * rW;
       R[k][3 + 3 * NU] += 2.0 * rVsEff;
 
+      // **NEW: Acceleration penalty (control smoothing) - penalize u - u_prev**
+      // Cost += rDu * (u[k] - u_prev)^2 = u[k]^T * rDu * u[k] - 2 * u_prev^T * rDu * u[k] + const
+      // Add rDu to R diagonal, add -2*rDu*u_prev to r
+      if (enableMpcDuPenalty && hasLastU)
+      {
+        R[k][0 + 0 * NU] += 2.0 * rDuVx;
+        R[k][1 + 1 * NU] += 2.0 * rDuVy;
+        R[k][2 + 2 * NU] += 2.0 * rDuW;
+        R[k][3 + 3 * NU] += 2.0 * rDuVs;
+
+        r[k][0] += -2.0 * rDuVx * lastU[0];
+        r[k][1] += -2.0 * rDuVy * lastU[1];
+        r[k][2] += -2.0 * rDuW * lastU[2];
+        r[k][3] += -2.0 * rDuVs * lastU[3];
+      }
+
       // **NEW: Direction guidance - encourage vs to match path direction**
       if (usePathDirectionHint && dir_ref != 0)
       {
@@ -774,6 +801,11 @@ int main(int argc, char **argv)
   nhPrivate.param("qVsDir", qVsDir, 5.0);
   nhPrivate.param("qGearSwitch", qGearSwitch, 10.0);
   nhPrivate.param("rInPlaceRot", rInPlaceRot, 0.1);
+  nhPrivate.param("enable_mpc_du_penalty", enableMpcDuPenalty, true);
+  nhPrivate.param("rDuVx", rDuVx, 10.0);
+  nhPrivate.param("rDuVy", rDuVy, 10.0);
+  nhPrivate.param("rDuW", rDuW, 5.0);
+  nhPrivate.param("rDuVs", rDuVs, 5.0);
   nhPrivate.param("stop_dis_thre", stopDisThre, 0.2);
   nhPrivate.param("align_dist_thre", alignDistThre, alignDistThre);
   nhPrivate.param("align_pos_thre", alignPosThre, alignPosThre);
@@ -860,10 +892,39 @@ int main(int argc, char **argv)
           }
           else if (goalDis > alignPosThre)
           {
+            // Calculate heading to goal in world frame
             double goalHeading = atan2(dyg, dxg);
             double headingBody = wrapAngle(goalHeading - vehicleYaw);
-            vxCmd = alignPosSpeed * cos(headingBody);
-            vyCmd = alignPosSpeed * sin(headingBody);
+
+            // Smart forward/reverse decision:
+            // If goal is behind us (|headingBody| > 90°) AND final yaw is similar to current yaw,
+            // then reverse to goal instead of turning around
+            bool shouldReverse = false;
+            if (fabs(headingBody) > PI / 2.0)  // Goal is behind (> 90°)
+            {
+              // Check if final yaw is close to current yaw (within ±90°)
+              // If yes, better to reverse; if no, better to turn and drive forward
+              if (fabs(yawErr) < PI / 2.0)
+              {
+                shouldReverse = true;
+              }
+            }
+
+            if (shouldReverse)
+            {
+              // Reverse to goal: flip heading by 180° and use negative speed
+              headingBody = wrapAngle(headingBody + PI);
+              vxCmd = -alignPosSpeed * cos(headingBody);
+              vyCmd = -alignPosSpeed * sin(headingBody);
+            }
+            else
+            {
+              // Forward to goal
+              vxCmd = alignPosSpeed * cos(headingBody);
+              vyCmd = alignPosSpeed * sin(headingBody);
+            }
+
+            // Rotate towards final yaw simultaneously
             wCmd = (yawErr > 0.0) ? alignYawSpeed : -alignYawSpeed;
           }
           else
@@ -976,6 +1037,16 @@ int main(int argc, char **argv)
             vyCmd = sol.uk[1] * speedScale;
             wCmd = sol.uk[2] * speedScale;
             double vs = sol.uk[3];
+
+            // **NEW: Update last control for acceleration penalty**
+            if (enableMpcDuPenalty)
+            {
+              lastU[0] = sol.uk[0];  // Store unscaled control
+              lastU[1] = sol.uk[1];
+              lastU[2] = sol.uk[2];
+              lastU[3] = sol.uk[3];
+              hasLastU = true;
+            }
 
             // **NEW: Update last direction for gear switch penalty**
             if (fabs(vs) > 0.01)
