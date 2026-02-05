@@ -416,10 +416,10 @@ void pathHandler(const nav_msgs::Path::ConstPtr &pathIn)
            pathSize, pathLength, forwardCount, reverseCount, rotateCount);
 
   // Show first few points with detailed debug
-  for (int i = 0; i < std::min(5, pathSize); i++)
+  for (int i = 0; i < std::min(1, pathSize); i++)
   {
     const char* dirStr = (pathDir[i] == 1) ? "fwd" : (pathDir[i] == -1) ? "rev" : "rot";
-    ROS_INFO("  [%d] dir=%s yaw=%.2f pos=(%.2f,%.2f)", i, dirStr, pathYaw[i], pathX[i], pathY[i]);
+    ROS_INFO("  dir=%s yaw=%.2f pos=(%.2f,%.2f)", i, dirStr, pathYaw[i], pathX[i], pathY[i]);
   }
 
   // Additional debug: show raw quaternion of first point
@@ -1069,8 +1069,13 @@ int main(int argc, char **argv)
               lastVsSign = (vs > 0) ? 1.0 : -1.0;
             }
 
-            ROS_INFO_THROTTLE(1.0, "\033[36mmpcc cmd: vx=%.3f vy=%.3f w=%.3f vs=%.3f dir=%s\033[0m",
-                              vxCmd, vyCmd, wCmd, vs, (vs >= 0) ? "forward" : "reverse");
+            ROS_INFO_THROTTLE(0.5, "\033[36mmpcc:\033[0m");
+            ROS_INFO_THROTTLE(0.5, "  path: vx=%.3f vy=%.3f", vx_path, vy_path);
+            ROS_INFO_THROTTLE(0.5, "  world: vx=%.3f vy=%.3f", vx_world, vy_world);
+            ROS_INFO_THROTTLE(0.5, "  body: vx=%.3f vy=%.3f w=%.3f", vxCmd, vyCmd, wCmd);
+            ROS_INFO_THROTTLE(0.5, "  vs=%.3f dir=%s yawRec=%.1f° yaw=%.1f°",
+                              vs, (vs >= 0) ? "fwd" : "rev",
+                              vehicleYawRec * 180.0 / PI, vehicleYaw * 180.0 / PI);
             last_s_guess.resize(N + 1);
             for (int k = 0; k <= N; k++)
               last_s_guess[k] = sol.xk[k * 4 + 3];
