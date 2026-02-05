@@ -1234,13 +1234,16 @@ int main(int argc, char **argv)
                   (1.0 - pathSmoothAlpha) * lastPath.poses[i].pose.position.z;
             }
           }
-          // Ensure valid orientation for all poses
+          // 设置路径点姿态为目标航向（body frame）
+          // 这对于MPCC正确判断前进/倒车方向至关重要
+          double goal_yaw_body = goalYaw - vehicleYaw_1;
+          // 归一化到 [-PI, PI]
+          while (goal_yaw_body > M_PI) goal_yaw_body -= 2.0 * M_PI;
+          while (goal_yaw_body < -M_PI) goal_yaw_body += 2.0 * M_PI;
+
           for (size_t i = 0; i < path.poses.size(); i++)
           {
-            path.poses[i].pose.orientation.x = 0.0;
-            path.poses[i].pose.orientation.y = 0.0;
-            path.poses[i].pose.orientation.z = 0.0;
-            path.poses[i].pose.orientation.w = 1.0;
+            path.poses[i].pose.orientation = tf::createQuaternionMsgFromYaw(goal_yaw_body);
           }
           pubPath.publish(path);                             // pubPath对象发布路径信息
           lastPath = path;
