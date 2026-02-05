@@ -1234,16 +1234,56 @@ int main(int argc, char **argv)
                   (1.0 - pathSmoothAlpha) * lastPath.poses[i].pose.position.z;
             }
           }
-          // 设置路径点姿态为目标航向（body frame）
-          // 这对于MPCC正确判断前进/倒车方向至关重要
+          // 设置路径点姿态：沿切线方向，考虑前进/倒车
+          // 1. 计算目标姿态（body frame）
           double goal_yaw_body = goalYaw - vehicleYaw_1;
-          // 归一化到 [-PI, PI]
           while (goal_yaw_body > M_PI) goal_yaw_body -= 2.0 * M_PI;
           while (goal_yaw_body < -M_PI) goal_yaw_body += 2.0 * M_PI;
 
+          // 2. 使用joyDir作为目标方向（已计算好，度数制转弧度）
+          double goal_dir = joyDir * M_PI / 180.0;
+
+          // 3. 判断是前进还是倒车：比较目标姿态和目标方向
+          double yaw_dir_diff = goal_yaw_body - goal_dir;
+          while (yaw_dir_diff > M_PI) yaw_dir_diff -= 2.0 * M_PI;
+          while (yaw_dir_diff < -M_PI) yaw_dir_diff += 2.0 * M_PI;
+          bool is_reverse = fabs(yaw_dir_diff) > M_PI / 2.0;  // 差值>90度则是倒车
+
+          // 4. 为每个路径点计算切线方向并设置姿态
           for (size_t i = 0; i < path.poses.size(); i++)
           {
-            path.poses[i].pose.orientation = tf::createQuaternionMsgFromYaw(goal_yaw_body);
+            double tangent_yaw;
+            if (i + 1 < path.poses.size())
+            {
+              // 前向差分计算切线
+              double dx = path.poses[i + 1].pose.position.x - path.poses[i].pose.position.x;
+              double dy = path.poses[i + 1].pose.position.y - path.poses[i].pose.position.y;
+              tangent_yaw = atan2(dy, dx);
+            }
+            else if (i > 0)
+            {
+              // 最后一个点用后向差分
+              double dx = path.poses[i].pose.position.x - path.poses[i - 1].pose.position.x;
+              double dy = path.poses[i].pose.position.y - path.poses[i - 1].pose.position.y;
+              tangent_yaw = atan2(dy, dx);
+            }
+            else
+            {
+              tangent_yaw = goal_dir;  // 只有一个点时用目标方向
+            }
+
+            // 如果是倒车，姿态朝向切线反方向（即机器人背对着运动方向）
+            double pose_yaw = is_reverse ? tangent_yaw + M_PI : tangent_yaw;
+            while (pose_yaw > M_PI) pose_yaw -= 2.0 * M_PI;
+            while (pose_yaw < -M_PI) pose_yaw += 2.0 * M_PI;
+
+            path.poses[i].pose.orientation = tf::createQuaternionMsgFromYaw(pose_yaw);
+          }
+
+          // 5. 最后一个点使用目标姿态（确保到达终点时姿态正确）
+          if (!path.poses.empty())
+          {
+            path.poses.back().pose.orientation = tf::createQuaternionMsgFromYaw(goal_yaw_body);
           }
           pubPath.publish(path);                             // pubPath对象发布路径信息
           lastPath = path;
