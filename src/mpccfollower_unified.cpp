@@ -21,7 +21,7 @@
 #include "hpipm_d_ocp_qp_dim.h"
 #include "hpipm_d_ocp_qp.h"
 #include "hpipm_d_ocp_qp_sol.h"
-#include "yhs_can_msgs/ctrl_cmd.h"
+// #include "yhs_can_msgs/ctrl_cmd.h"  // Commented out - package not available
 using std::vector;
 
 const double PI = 3.141592653589793;
@@ -844,7 +844,7 @@ int main(int argc, char **argv)
   ros::Subscriber subGoalReached = nh.subscribe<std_msgs::Bool>("/goal_reached", 5, goalReachedHandler);
 
   ros::Publisher pubSpeed = nh.advertise<geometry_msgs::Twist>("/cmd_vel", 5);
-  ros::Publisher yhs_ctrl_pub = nh.advertise<yhs_can_msgs::ctrl_cmd>("/ctrl_cmd", 1);
+  // ros::Publisher yhs_ctrl_pub = nh.advertise<yhs_can_msgs::ctrl_cmd>("/ctrl_cmd", 1);  // Commented out
   pubGoalReached = nh.advertise<std_msgs::Bool>("/goal_reached", 1, true);
 
   ros::Publisher pubPred = nh.advertise<nav_msgs::Path>("/mpcc_pred_path", 5);
@@ -930,25 +930,32 @@ int main(int argc, char **argv)
               }
             }
 
+            // **FIX: Use proportional control with saturation for smoother approach**
+            double posSpeedScale = std::min(1.0, goalDis / alignDistThre);  // Slow down near goal
+            double effPosSpeed = alignPosSpeed * posSpeedScale;
+
             if (shouldReverse)
             {
               // Reverse to goal: flip heading by 180° and use negative speed
               headingBody = wrapAngle(headingBody + PI);
-              vxCmd = -alignPosSpeed * cos(headingBody);
-              vyCmd = -alignPosSpeed * sin(headingBody);
+              vxCmd = -effPosSpeed * cos(headingBody);
+              vyCmd = -effPosSpeed * sin(headingBody);
             }
             else
             {
               // Forward to goal
-              vxCmd = alignPosSpeed * cos(headingBody);
-              vyCmd = alignPosSpeed * sin(headingBody);
+              vxCmd = effPosSpeed * cos(headingBody);
+              vyCmd = effPosSpeed * sin(headingBody);
             }
 
-            // Rotate towards final yaw simultaneously
-            wCmd = (yawErr > 0.0) ? alignYawSpeed : -alignYawSpeed;
+            // **FIX: Use proportional control for rotation (avoid bang-bang oscillation)**
+            double wGain = 2.0;  // P gain for yaw control
+            wCmd = wGain * yawErr;
+            wCmd = clampVal(wCmd, -alignYawSpeed, alignYawSpeed);
           }
           else
           {
+            // Position within threshold, just adjust yaw
             if (yawErrDeg <= alignYawThreDeg)
             {
               vxCmd = 0.0;
@@ -969,7 +976,10 @@ int main(int argc, char **argv)
             {
               vxCmd = 0.0;
               vyCmd = 0.0;
-              wCmd = (yawErr > 0.0) ? alignYawSpeed : -alignYawSpeed;
+              // **FIX: Use proportional control for final yaw adjustment**
+              double wGain = 2.0;
+              wCmd = wGain * yawErr;
+              wCmd = clampVal(wCmd, -alignYawSpeed, alignYawSpeed);
             }
           }
           if (align_log_pending)
@@ -1218,11 +1228,11 @@ int main(int argc, char **argv)
       }
 
       pubSpeed.publish(cmd_out);
-      yhs_can_msgs::ctrl_cmd yhs_cmd_vel;
-      yhs_cmd_vel.ctrl_cmd_gear = 6;
-      yhs_cmd_vel.ctrl_cmd_x_linear = cmd_out.linear.x;
-      yhs_cmd_vel.ctrl_cmd_z_angular = cmd_out.angular.z * 57.29d;
-      yhs_ctrl_pub.publish(yhs_cmd_vel);
+      // yhs_can_msgs::ctrl_cmd yhs_cmd_vel;
+      // yhs_cmd_vel.ctrl_cmd_gear = 6;
+      // yhs_cmd_vel.ctrl_cmd_x_linear = cmd_out.linear.x;
+      // yhs_cmd_vel.ctrl_cmd_z_angular = cmd_out.angular.z * 57.29d;
+      // yhs_ctrl_pub.publish(yhs_cmd_vel);
     }
 
     rate.sleep();
